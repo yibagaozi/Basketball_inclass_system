@@ -1,5 +1,20 @@
 # Changelog
 
+## 2.1.0 — 2026-09-07
+
+### 新增
+- **跨课次人脸全局 ID**：InsightFace 人脸质心匹配 → `stu_global_XX`（`data/identity/`）
+- 每堂注册后自动把 session 内 `stu_XX` 与全局 ID 链接；**衣着/身体仍为当堂 gallery**
+- 工具：`scripts/link_global_identity.py`、`scripts/validate_global_identity.py`
+- 文档：`docs/身份识别跨课次全局ID.md`；schema 示例在 `data/schema_examples/`
+- 变更前源码备份：`versions/v2.0.8/`
+
+### 验证
+- 身份自洽（克隆 gallery 二次 link）：**6/6**
+- v2↔v3 跨课次（不同人）：阈值 0.58 下 **0 误匹配**；registry 写入 10 个 global id
+- v3 动作/课内 ID：`eval_v3_gt` **7/7 PASS**（id_acc=1.0）
+- v2 动作：现有 outputs **4/7**（相对 2.0.6 报告漂移，与本次身份改动无关；见 `docs/身份验证_v2.1.0.md`）
+
 ## 2.0.7 — 2026-08-06
 
 ### 改进

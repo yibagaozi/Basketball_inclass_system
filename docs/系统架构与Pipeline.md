@@ -128,7 +128,14 @@ CREATED → … → RECORDED → PERCEPTION_DONE → SYNC_DONE →
 | `face_alpha_high` | 0.85 | 仅 `face_body*` 模式：正脸人脸权重 |
 | `face_score_threshold` | 0.8 | 判定「正脸」的阈值 |
 
-代码：`src/identity/sequential_enroll.py` · `tracker.py` · `clothing_color.py` · `perception.py` · `enrollment.py`
+代码：`src/identity/sequential_enroll.py` · `tracker.py` · `clothing_color.py` · `perception.py` · `enrollment.py` · `global_registry.py`
+
+### 4.1b 跨课次全局 ID（v2.1）
+
+- **人脸**写入 `data/identity/` 全局库，分配/匹配 `stu_global_XX`（跨课堂同一人同一全局 ID）。
+- **衣着 / body** 仍只存在于当堂 `data/enrollment/<session>/stu_XX/`，供课内跟踪。
+- 课内跟踪与评测主键仍是 `stu_XX`；对应关系见 `meta.global_id` 与 `data/identity/sessions/<session>.json`。
+- 详见 [身份识别跨课次全局 ID](./身份识别跨课次全局ID.md)。
 
 ### 4.2 跨机位原则
 
@@ -279,7 +286,7 @@ PYTHONPATH=. python scripts/sync_cameras.py --session <uuid> --student stu_g01
 | 机位注册表 | `src/cameras/registry.py` |
 | 时间对齐 | `src/cameras/temporal.py` · `src/cameras/event_sync.py` |
 | 单机位感知 | `src/perception/camera_pipeline.py` · `yolo_pose_detector.py` |
-| ReID | `src/identity/`（`clothing_color.py` · `tracker.py`） |
+| ReID | `src/identity/`（`clothing_color.py` · `tracker.py` · `global_registry.py`） |
 | 骨架质量过滤 | `src/pose/skeleton_quality.py` |
 | 规则动作 | `src/action/pipeline.py` · `multicam_release.py` · `pose_only.py` · `registry.py` |
 | 近实时 | `src/streaming/fast_path.py` |

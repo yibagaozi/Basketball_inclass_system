@@ -1,0 +1,32 @@
+{
+  "schema": "session_identity_link/v1",
+  "session_id": "22222222-2222-2222-2222-222222222222",
+  "updated_at": "2026-09-07T00:00:00Z",
+  "registry_path": "data/identity/global_registry.json",
+  "enrollment_root": "data/enrollment/22222222-2222-2222-2222-222222222222",
+  "mappings": [
+    {
+      "local_id": "stu_00",
+      "global_id": "stu_global_03",
+      "match_score": 0.0,
+      "match_margin": 0.0,
+      "is_new": true,
+      "n_face_samples": 3,
+      "n_body_samples": 6,
+      "n_color_samples": 6,
+      "has_clothing": true
+    },
+    {
+      "local_id": "stu_02",
+      "global_id": "stu_global_00",
+      "match_score": 0.71,
+      "match_margin": 0.18,
+      "is_new": false,
+      "n_face_samples": 4,
+      "n_body_samples": 6,
+      "n_color_samples": 6,
+      "has_clothing": true
+    }
+  ],
+  "notes": "local_id (stu_XX) is session-scoped for tracking/clothing; global_id is face-stable across classes."
+}

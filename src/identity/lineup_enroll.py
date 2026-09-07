@@ -245,4 +245,21 @@ def enroll_lineup_from_video(
             f"  [enroll-lineup] WARNING: expected {expected_persons}, got {len(student_ids)}",
             flush=True,
         )
+    # Cross-session face → global_id; clothing/body stay session-local under stu_XX
+    try:
+        from src.identity.global_registry import link_session_enrollment_to_global
+
+        link = link_session_enrollment_to_global(session_id, student_ids, gallery=gallery)
+        if link.get("mappings"):
+            print(
+                f"  [enroll-lineup] global registry: "
+                + ", ".join(
+                    f"{m['local_id']}→{m['global_id']}"
+                    + ("*" if m.get("is_new") else "")
+                    for m in link["mappings"]
+                ),
+                flush=True,
+            )
+    except Exception as e:
+        print(f"  [enroll-lineup] WARNING: global registry link failed: {e}", flush=True)
     return student_ids

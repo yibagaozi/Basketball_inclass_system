@@ -132,6 +132,20 @@ identity:
   body_match_threshold: 0.65
   gallery_face_samples: 5
   gallery_body_samples: 12
+  # Cross-class face identity (InsightFace) → stu_global_XX; clothing/body remain session-local
+  global_registry:
+    enabled: true
+    registry_relpath: identity/global_registry.json
+    faces_relpath: identity/faces
+    sessions_relpath: identity/sessions
+    id_prefix: stu_global
+    # Distant classroom faces: after body-crop + consensus, same-person ~0.53–0.65
+    face_match_threshold: 0.52
+    ambiguity_margin: 0.05
+    centroid_weight: 0.6          # blend centroid cosine with mutual best-mean
+    consensus_min_sim: 0.40       # drop outlier face samples before centroid
+    update_on_match: true
+    max_face_samples_per_student: 24
   # Prefer tracklet-aggregated color over noisy single-frame clothing
   clothing_color_weight: 0.55
   tracklet_color_weight_scale: 1.05

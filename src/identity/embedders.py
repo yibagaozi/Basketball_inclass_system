@@ -6,6 +6,7 @@ import hashlib
 from abc import ABC, abstractmethod
 from pathlib import Path
 
+import cv2
 import numpy as np
 
 
@@ -91,14 +92,48 @@ class InsightFaceEmbedder(FaceEmbedder):
             raise RuntimeError("InsightFace not available")
 
     def embed(self, image_bgr: np.ndarray, bbox: list[float] | None = None) -> np.ndarray | None:
-        faces = self._app.get(image_bgr)
+        """Embed face; when bbox is given, detect inside a padded crop (not full frame).
+
+        Full-frame detection often picks a clearer bystander when the subject is
+        small/shadowed — that contaminated cross-session matching.
+        """
+        crop = image_bgr
+        offset_x, offset_y = 0, 0
+        if bbox is not None:
+            h, w = image_bgr.shape[:2]
+            x1, y1, x2, y2 = [float(v) for v in bbox]
+            bw, bh = max(1.0, x2 - x1), max(1.0, y2 - y1)
+            pad = 0.15
+            x1 = max(0, int(x1 - pad * bw))
+            y1 = max(0, int(y1 - pad * bh))
+            x2 = min(w, int(x2 + pad * bw))
+            y2 = min(h, int(y2 + pad * bh))
+            if x2 <= x1 or y2 <= y1:
+                return None
+            crop = image_bgr[y1:y2, x1:x2]
+            # Upscale tiny crops so the detector can fire reliably.
+            ch, cw = crop.shape[:2]
+            if max(ch, cw) < 320:
+                scale = 320.0 / max(ch, cw)
+                crop = cv2.resize(crop, (int(cw * scale), int(ch * scale)))
+
+        faces = self._app.get(crop)
         if not faces:
             return None
         if bbox is not None:
-            cx = (bbox[0] + bbox[2]) / 2
-            cy = (bbox[1] + bbox[3]) / 2
-            faces = sorted(faces, key=lambda f: (f.bbox[0] - cx) ** 2 + (f.bbox[1] - cy) ** 2)
-        return faces[0].normed_embedding.astype(np.float32)
+            # Prefer highest-det face whose center lies in the upper portion of the crop.
+            scored = []
+            ch = float(crop.shape[0])
+            for f in faces:
+                ds = float(f.det_score)
+                fcy = (float(f.bbox[1]) + float(f.bbox[3])) / 2.0
+                if fcy > 0.80 * ch:
+                    continue
+                scored.append((ds, f))
+            if scored:
+                scored.sort(key=lambda t: t[0], reverse=True)
+                return scored[0][1].normed_embedding.astype(np.float32)
+        return max(faces, key=lambda f: float(f.det_score)).normed_embedding.astype(np.float32)
 
 
 def create_face_embedder(prefer_insightface: bool = True) -> FaceEmbedder:
