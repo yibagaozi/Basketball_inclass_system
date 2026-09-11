@@ -228,6 +228,79 @@ def scan_frontal_candidates(
     return samples
 
 
+def scan_frontal_candidates_from_frames(
+    frames: list[tuple[int, float, np.ndarray]],
+    *,
+    min_area_ratio: float = 0.035,
+    min_frontal: float = 0.40,
+    score_thr: float = 0.35,
+    cx_range: tuple[float, float] = (0.18, 0.82),
+    min_dominance: float = 1.35,
+    closeup_area: float = 0.085,
+    keep_frames: bool = True,
+) -> list[EnrollSample]:
+    """Same frontal scoring as video scan, but over in-memory live frames (no mp4)."""
+    backend, kind = _load_yolo()
+    body = create_body_embedder()
+    samples: list[EnrollSample] = []
+    for i, t, frame in frames:
+        fh, fw = frame.shape[:2]
+        frame_area = float(fh * fw)
+        dets = _detect_persons_pose(backend, kind, frame, score_thr)
+        sized: list[tuple[float, dict]] = []
+        for d in dets:
+            x1, y1, x2, y2 = d["bbox"]
+            ar = (x2 - x1) * (y2 - y1) / frame_area
+            if ar >= 0.022:
+                sized.append((ar, d))
+        sized.sort(key=lambda x: x[0], reverse=True)
+        best: tuple[float, dict, float, float] | None = None
+        second_ar = sized[1][0] if len(sized) > 1 else 0.0
+        for ar, d in sized:
+            x1, y1, x2, y2 = d["bbox"]
+            cx = 0.5 * (x1 + x2) / fw
+            if ar < min_area_ratio or not (cx_range[0] <= cx <= cx_range[1]):
+                continue
+            dominance = ar / (second_ar + 1e-6)
+            if ar < closeup_area and dominance < min_dominance:
+                continue
+            kp = d.get("keypoints")
+            if kp is not None and getattr(kp, "shape", None) is not None and kp.shape[0] >= 17:
+                fs = _frontal_score(kp[:, :2], kp[:, 2])
+            else:
+                fs = 0.25
+            q = (
+                fs * 0.50
+                + min(ar / 0.12, 1.0) * 0.30
+                + min(dominance / 3.0, 1.0) * 0.10
+                + (1.0 - abs(cx - 0.5)) * 0.10
+            )
+            if best is None or q > best[0]:
+                best = (q, d, ar, fs)
+        if best is None:
+            continue
+        q, d, ar, fs = best
+        if fs < min_frontal or ar < min_area_ratio:
+            continue
+        bbox = list(map(float, d["bbox"]))
+        kp = d.get("keypoints")
+        emb = body.embed(frame, bbox)
+        color = extract_clothing_color(frame, bbox, keypoints=kp)
+        samples.append(EnrollSample(
+            frame_idx=int(i),
+            timestamp_s=float(t),
+            bbox=bbox,
+            area_ratio=float(ar),
+            frontal_score=float(fs),
+            quality=float(q),
+            body_emb=emb,
+            color_desc=color,
+            keypoints=kp,
+            frame_bgr=frame.copy() if keep_frames else None,
+        ))
+    return samples
+
+
 def cluster_sequential_enrollments(
     samples: list[EnrollSample],
     *,
@@ -342,8 +415,11 @@ def write_enrollment_gallery(
         return []
     gallery = EnrollmentGallery(session_id)
     face_emb = create_face_embedder()
-    # Reload frames for best samples if not cached
-    cap = cv2.VideoCapture(str(video_path))
+    # Reload frames for best samples if not cached (live path keeps frame_bgr)
+    cap = None
+    src = Path(video_path) if video_path else None
+    if src is not None and src.exists():
+        cap = cv2.VideoCapture(str(src))
     student_ids: list[str] = []
 
     if preview_dir is not None:
@@ -365,11 +441,13 @@ def write_enrollment_gallery(
         for s in chosen:
             if s.frame_bgr is not None:
                 frame = s.frame_bgr
-            else:
+            elif cap is not None:
                 cap.set(cv2.CAP_PROP_POS_FRAMES, s.frame_idx)
                 ok, frame = cap.read()
                 if not ok:
                     continue
+            else:
+                continue
             face_bbox = _estimate_face_bbox(s.bbox, frame.shape)
             # Try real face embed; still store body/color always
             emb = face_emb.embed(frame, face_bbox)
@@ -403,9 +481,13 @@ def write_enrollment_gallery(
         student_ids.append(person.student_id)
 
         if preview_dir is not None:
-            cap.set(cv2.CAP_PROP_POS_FRAMES, best.frame_idx)
-            ok, frame = cap.read()
-            if ok:
+            frame = best.frame_bgr
+            if frame is None and cap is not None:
+                cap.set(cv2.CAP_PROP_POS_FRAMES, best.frame_idx)
+                ok, frame = cap.read()
+                if not ok:
+                    frame = None
+            if frame is not None:
                 x1, y1, x2, y2 = map(int, best.bbox)
                 vis = frame.copy()
                 cv2.rectangle(vis, (x1, y1), (x2, y2), (0, 255, 0), 3)
@@ -415,7 +497,8 @@ def write_enrollment_gallery(
                 )
                 cv2.imwrite(str(preview_dir / f"{person.student_id}.jpg"), vis)
 
-    cap.release()
+    if cap is not None:
+        cap.release()
     # Cross-session face → global_id; clothing/body stay session-local under stu_XX
     try:
         from src.identity.global_registry import link_session_enrollment_to_global
@@ -496,4 +579,48 @@ def enroll_sequential_from_video(
         )
     return write_enrollment_gallery(
         session_id, people, video_path, preview_dir=preview_dir,
+    )
+
+
+def enroll_sequential_from_frames(
+    session_id: str,
+    frames: list[tuple[int, float, np.ndarray]],
+    *,
+    id_prefix: str = "stu",
+    preview_dir: Path | None = None,
+    max_persons: int = 16,
+    expected_persons: int | None = None,
+    **scan_kwargs: Any,
+) -> list[str]:
+    """Live sequential frontal enroll from preview frames (no mp4)."""
+    perc = get_perception_config()
+    min_ar = float(scan_kwargs.pop(
+        "min_area_ratio", max(0.03, float(perc.get("min_person_area_ratio", 0.015))),
+    ))
+    samples = scan_frontal_candidates_from_frames(
+        frames,
+        min_area_ratio=min_ar,
+        keep_frames=True,
+        **scan_kwargs,
+    )
+    cluster_max = max(max_persons, (expected_persons or 0) + 4)
+    people = cluster_sequential_enrollments(
+        samples,
+        id_prefix=id_prefix,
+        max_persons=cluster_max,
+        min_samples=2,
+        min_max_frontal=0.42,
+        min_max_area=0.040,
+        gap_split_s=1.2,
+        same_body_thr=0.62,
+        revisit_body_thr=0.82,
+        revisit_color_thr=0.75,
+        revisit_max_gap_s=4.0,
+    )
+    if expected_persons is not None and len(people) > expected_persons:
+        people = sorted(people, key=lambda p: p.t0)[:expected_persons]
+        for i, p in enumerate(people):
+            p.student_id = f"{id_prefix}_{i:02d}"
+    return write_enrollment_gallery(
+        session_id, people, Path(f"live://{session_id}"), preview_dir=preview_dir,
     )

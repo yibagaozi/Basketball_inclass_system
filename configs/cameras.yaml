@@ -40,6 +40,7 @@ cameras:
     position: sideline_left
     resolution: [1920, 1080]
     fps: 30
+    rtsp_url: rtsp://127.0.0.1:8554/cam_01
     pipeline: isolated
     coverage: three_point_arc_left
     roles:
@@ -59,6 +60,7 @@ cameras:
     position: sideline_right
     resolution: [1920, 1080]
     fps: 30
+    rtsp_url: rtsp://127.0.0.1:8554/cam_02
     pipeline: isolated
     coverage: three_point_arc_right
     roles:
@@ -76,6 +78,7 @@ cameras:
     position: baseline_free_throw
     resolution: [1920, 1080]
     fps: 30
+    rtsp_url: rtsp://127.0.0.1:8554/cam_03
     pipeline: isolated
     coverage: free_throw_lane
     roles:
@@ -94,6 +97,7 @@ cameras:
     position: backboard_rim
     resolution: [1920, 1080]
     fps: 30
+    rtsp_url: rtsp://127.0.0.1:8554/cam_04
     pipeline: isolated
     coverage: rim_and_release
     roles:

@@ -4,13 +4,14 @@
 
 - 四机位独立感知（cam_01–03：**YOLO11m-Pose** + **RTMW-l**；cam_04：球/筐）
 - **v2 注册**：group0 在 **cam_01** 顺序正面注册 → 多人 gallery；后续组复用
+- **v2.2 直播**：四路 RTSP + 独立 WebSocket JSON（默认 `127.0.0.1:8765`）
 - 事件对齐估常量时间偏移（出手峰 / 篮筐球段）
 - 规则动作切分：`pass` | `triple_threat` | `free_throw` | **`jump_shot`** | `layup`
 - 身份：默认 **`face_body_color`**（人脸 + OSNet + 衣服色）；`realtime`/`full` 不改 match_mode，只改跳帧/球检分辨率/viz
 - cam_04 进球：球心门控 + 筐沿橙色遮挡否决 + 轨迹 make/miss
 - 批处理：`realtime`（精简）/ `full`（全量 + viz）
 
-版本见根目录 [`VERSION`](./VERSION)（当前 **2.0.7**）。源码快照：`versions/v2.0.7/`（另有历史 `versions/v1/`、`versions/v2/`）。
+版本见根目录 [`VERSION`](./VERSION)（当前 **2.2.0**）。源码快照：`versions/v2.0.7/`（另有历史 `versions/v1/`、`versions/v2/`）。
 
 ## 快速开始
 
@@ -47,9 +48,11 @@ python -c "from src.privacy.db import init_db; init_db()"
 | 正式 session | `PYTHONPATH=. python pipelines/run_session.py --session-id <uuid> --from-stage perception --init-db` |
 | 事件对齐 | `PYTHONPATH=. python scripts/sync_cameras.py --session <uuid> --student stu_00` |
 | 球场标定 | `PYTHONPATH=. python scripts/calibrate_court.py …` |
+| **直播 2.2.0** | `PYTHONPATH=. python scripts/run_live_ws.py setup --session live_demo` |
+| 直播推理 + WS | `PYTHONPATH=. python scripts/run_live_ws.py run --session live_demo` |
 | Dashboard | `PYTHONPATH=. python scripts/build_group_dashboard.py --all-v1` |
 | 教师端 | `python -m apps.teacher_ui.main` |
-| 单测 | `PYTHONPATH=. python tests/test_pipeline.py && PYTHONPATH=. python tests/test_v2.py` |
+| 单测 | `PYTHONPATH=. python tests/test_pipeline.py && PYTHONPATH=. python tests/test_v2.py && PYTHONPATH=. python tests/test_live_ws.py` |
 
 输出目录：
 - v3：`data/outputs/v3/group_0X/`（含 viz 视频 + dashboard；`--mode full` 默认渲 viz）

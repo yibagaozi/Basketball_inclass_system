@@ -1,4 +1,4 @@
-# 文档索引 — 系统 v2.1
+# 文档索引 — 系统 v2.2
 
 > 真相源优先：代码与 `configs/` > 本目录「现行」文档 > 历史调研/计划稿
 
@@ -7,6 +7,7 @@
 | 文档 | 内容 |
 |------|------|
 | [系统架构与 Pipeline](./系统架构与Pipeline.md) | **架构真相源**：注册 / ReID / 动作（含 jump_shot）/ 进球 |
+| [直播 RTSP 与 WebSocket](./直播RTSP与WebSocket.md) | **v2.2.0**：四路直播推理、同步/标定/注册、WS JSON |
 | [身份识别跨课次全局 ID](./身份识别跨课次全局ID.md) | **v2.1**：人脸全局 `stu_global_XX` + 当堂衣着 gallery |
 | [身份验证 v2.1.0](./身份验证_v2.1.0.md) | v2/v3 身份自洽 + 动作评测快照 |
 | [v2 测试集动作真值](./v2测试集动作真值.md) | group0–6 真值标签（效果验证基准） |
@@ -44,4 +45,9 @@ PYTHONPATH=. python scripts/build_group_dashboard.py --all-v1
 # 单测
 PYTHONPATH=. python tests/test_pipeline.py
 PYTHONPATH=. python tests/test_v2.py
+PYTHONPATH=. python tests/test_live_ws.py
+
+# 直播（独立进程，不改离线批处理）
+PYTHONPATH=. python scripts/run_live_ws.py setup --session live_demo
+PYTHONPATH=. python scripts/run_live_ws.py run --session live_demo
 ```

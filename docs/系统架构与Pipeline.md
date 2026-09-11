@@ -1,7 +1,7 @@
 # 篮球课堂辅助教学系统 — 系统架构与完整 Pipeline
 
-> **版本：v2.0** · 更新：2026-07-24  
-> 关联：[GPU 环境](./环境配置GPU.md) · [练习区域](../configs/zones.yaml) · [输出格式](./输出格式设计.md) · [历史调研](./调研报告_三维骨架提取与ReID.md)
+> **版本：v2.2.0** · 更新：2026-09-11  
+> 关联：[GPU 环境](./环境配置GPU.md) · [练习区域](../configs/zones.yaml) · [输出格式](./输出格式设计.md) · [直播 RTSP / WS](./直播RTSP与WebSocket.md) · [历史调研](./调研报告_三维骨架提取与ReID.md)
 
 ---
 
@@ -18,7 +18,7 @@
 | 关节角 | 设计目标 **Pose2Sim 真 3D**（当前 demo 用伪 3D / 标定三角化）；见 `docs/球场标定指南.md` |
 | 进球判定 | **cam_04**：球心门控 → clip 贪心对齐 → **筐沿遮挡否决 + 轨迹** make/miss |
 | 批处理模式 | `realtime`（精简/近实时）与 `full`（全分辨率 + viz）；v2 见 `scripts/run_v2_testset.py` |
-| 近实时 | 目标：动作结束后 **≤10s** 给出类型 + 命中（见 §9.1） |
+| 近实时 | 动作结束后给出类型 + 命中；**2.2.0** 直播路径见 §9.2 / [直播文档](./直播RTSP与WebSocket.md) |
 
 ### 1.2 四机位职责
 
@@ -289,7 +289,7 @@ PYTHONPATH=. python scripts/sync_cameras.py --session <uuid> --student stu_g01
 | ReID | `src/identity/`（`clothing_color.py` · `tracker.py` · `global_registry.py`） |
 | 骨架质量过滤 | `src/pose/skeleton_quality.py` |
 | 规则动作 | `src/action/pipeline.py` · `multicam_release.py` · `pose_only.py` · `registry.py` |
-| 近实时 | `src/streaming/fast_path.py` |
+| 近实时 | `src/streaming/fast_path.py` · **`scripts/run_live_ws.py`** |
 | 3D 融合 | `src/pose/pose2sim_wrapper.py`（session stub）· `src/pose/triangulate.py`（标定 DLT / viewer） |
 | 球场标定 | `src/calibration/` · `scripts/calibrate_court.py` |
 | 参考模板 | `src/pose/reference_template.py` |
@@ -344,12 +344,25 @@ data/sessions/{id}/
 | 组件 | 路径 | 说明 |
 |------|------|------|
 | Finalize / 延迟估算 | `src/streaming/fast_path.py` | 对已感知 session 做 finalize 验证 |
-| 环形缓冲类型 | `TimestampRingBuffer` | 为 always-on 采集预留；尚未接直播 |
+| 环形缓冲 | `TimestampRingBuffer` | **2.2.0** 由 `LiveEngine` 接入四路 RTSP |
 | 延迟校验脚本 | `scripts/validate_fastpath_latency.py` | 读各组 `summary.json`，可写出延迟报告 |
 
 ```bash
 PYTHONPATH=. python scripts/validate_fastpath_latency.py --groups 1,2,3,4,5,6,7,8
 ```
+
+### 9.2 直播 RTSP + WebSocket（v2.2.0）
+
+独立进程，不进 teacher_ui。默认绑定 `127.0.0.1:8765`，只推 JSON。
+
+| 步骤 | 入口 |
+|------|------|
+| 人工同步 GUI | `scripts/run_live_ws.py sync` |
+| 直播抽帧标定 | `scripts/run_live_ws.py calibrate` → `data/calibration/live_{session}/` |
+| 正面顺序注册 | `scripts/run_live_ws.py enroll`（不落 mp4） |
+| 推理 + WS | `scripts/run_live_ws.py run` |
+
+动作 finalize 时一条消息，含 `angles[]`（多视三角化，`src/pose/angles.py` 的 `ANGLE_KEYS`）。断流发 `timeline_gap` 并重连，offsets 不重估。流结束后不生成 dashboard。详见 [直播 RTSP 与 WebSocket](./直播RTSP与WebSocket.md)。
 
 ---
 
@@ -437,6 +450,16 @@ PYTHONPATH=. python scripts/validate_fastpath_latency.py --groups 1,2,3,4
 
 ## 11. 能力清单
 
+### v2.2.0
+
+| 能力 | 状态 |
+|------|------|
+| 四路 RTSP 不录像推理 | ✅ `src/acquisition/rtsp.py` |
+| 开课同步 GUI + 本堂标定 | ✅ `run_live_ws.py sync/calibrate` |
+| 直播顺序注册 + 全局人脸 | ✅ 衣着当堂 |
+| WebSocket JSON（8765） | ✅ finalize 一条 + `timeline_gap` |
+| 3D 真角度 `angles[]` | ✅ 启动标定三角化 |
+
 ### v2.0
 
 | 能力 | 状态 |
@@ -460,6 +483,6 @@ PYTHONPATH=. python scripts/validate_fastpath_latency.py --groups 1,2,3,4
 | realtime \| full 批处理 + viz / dashboard | ✅ |
 | Fast-path finalize + ≤10s 校验 | ✅ |
 | SessionOutput 导出 | ✅ |
-| Always-on 直播环形缓冲接入 | ⏳ 类型已预留 |
-| Pose2Sim 真三角化进 session | ⏳ stub；viewer 已可用标定 DLT |
+| Always-on 直播环形缓冲接入 | ✅ 2.2.0：四路 RTSP → ring → WS JSON |
+| Pose2Sim 真三角化进 session | ⏳ stub；直播/viewer 已可用标定 DLT |
 | Face-Body 双模态 | ✅ 代码保留，非默认 |

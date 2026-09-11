@@ -1,0 +1,56 @@
+# 2.2.0 四路 RTSP 直播推理 + WebSocket JSON
+# 离线 mkv 批处理不受本文件影响。
+
+session_prefix: live
+
+websocket:
+  host: 127.0.0.1
+  port: 8765
+  path: /
+
+clock:
+  anchor_camera: cam_03
+  # common_ms = local_ms - offset_ms；锚点必须为 0
+  # 启动同步 GUI 写入的 json 优先于此处
+  camera_time_offsets_ms:
+    cam_01: 0.0
+    cam_02: 0.0
+    cam_03: 0.0
+    cam_04: 0.0
+
+capture:
+  # 对齐优先：不抽帧、不录像。队列满时丢最旧帧并记 warning，不断流。
+  queue_max_frames: 60
+  reconnect_sec: 1.5
+  open_timeout_sec: 8.0
+  # 相邻成功帧 wall-clock 间隔超过此值 → timeline_gap
+  gap_ms: 900
+  ffmpeg_tcp: true
+
+ring:
+  capacity_ms: 60000
+
+finalize:
+  # 动作 end_ms 之后再等这么久，收齐尾帧，然后一条 WS
+  post_delay_ms: 400
+  min_repeat_gap_ms: 1600
+  pose_pre_ms: 1800
+  pose_post_ms: 900
+
+identity:
+  # 开播前正面顺序注册用的机位（与 cameras.yaml enrollment_camera 一致时可省略）
+  enroll_camera: cam_02
+  enroll_sample_hz: 8.0
+  clothing_session_local: true   # 衣着/身体 ReID 只用当堂 gallery
+
+calibration:
+  # 本堂标定目录：data/calibration/live_{session}/
+  # 不覆盖 data/calibration/v2_4cam_zoned 除非 --out 显式指定
+  cameras: [cam_01, cam_02, cam_03]
+
+# 占位；现场改成真实 RTSP。验收可用 ffmpeg 推到本机（见 docs/直播RTSP与WebSocket.md）
+rtsp:
+  cam_01: rtsp://127.0.0.1:8554/cam_01
+  cam_02: rtsp://127.0.0.1:8554/cam_02
+  cam_03: rtsp://127.0.0.1:8554/cam_03
+  cam_04: rtsp://127.0.0.1:8554/cam_04

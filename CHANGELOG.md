@@ -1,5 +1,20 @@
 # Changelog
 
+## 2.2.0 — 2026-09-11
+
+### 新增
+- **四路 RTSP 直播推理**：cam_01–04 同时拉流，不抽帧、不写 `sessions/.../raw/*.mp4`
+- **开课启动**：人工同步 GUI（`camera_time_offsets_ms`，锚点 cam_03=0）+ 直播抽帧球场标定（本堂 `data/calibration/live_{session}/`，不覆盖 v2/v3）
+- **开播前正面顺序注册**：直播预览、不落 mp4；人脸匹配全局 `stu_global_XX`，衣着/身体 ReID 仅当堂 gallery
+- **独立 WebSocket**（默认 `127.0.0.1:8765`，不挂 teacher_ui）：动作 **finalize 时一条 JSON**（含 `angles[]` 真 3D 关节角）+ `timeline_gap`
+- 断流自动重连，**沿用启动时 offsets**，不重估同步；流结束 **不** 自动 dashboard；事件可归档 `data/outputs/live/{session}/events.jsonl`
+- 入口：`scripts/run_live_ws.py {sync,calibrate,enroll,run,setup}`
+- 文档：`docs/直播RTSP与WebSocket.md`（含 ffmpeg 模拟四路 RTSP）
+- 单测：`tests/test_live_ws.py`（偏移、gap、角度 schema、WS 可空字段；不依赖真摄像机）
+
+### 兼容
+- `run_v*_testset.py` / `pipelines/run_session.py` 与既有离线输出 **只多不减**
+
 ## 2.1.0 — 2026-09-07
 
 ### 新增

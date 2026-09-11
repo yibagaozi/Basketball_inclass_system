@@ -15,23 +15,13 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from src.config import data_path  # noqa: E402
-from src.pose.angles import compute_frame_angles, compute_h36m_angles  # noqa: E402
+from src.pose.angles import ANGLE_KEYS, compute_frame_angles, compute_h36m_angles  # noqa: E402
 from src.pose.reference_template import kpts133_to_pseudo3d  # noqa: E402
 from src.viz.identity_style import (  # noqa: E402
     compute_chrono_display_order,
     format_student_label,
     student_color_hex,
 )
-
-ANGLE_KEYS = [
-    "right_elbow",
-    "left_elbow",
-    "right_knee",
-    "left_knee",
-    "right_wrist",
-    "shooting_elbow",
-    "shooting_wrist",
-]
 
 
 def _clip_shooting_hand(clip: dict) -> str | None:

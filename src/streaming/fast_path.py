@@ -6,10 +6,10 @@ Design (matches 10s teacher feedback goal)
 * On event (ball above hoop / release peak): finalize a short window
 * Emit compact JSON immediately; 3D / viz / dashboard are async
 
-**Current status:** production validation uses ``finalize_action_from_session``
-on already-perceived sessions (pose/ball on disk). ``TimestampRingBuffer`` is
-the online buffer type for a future always-on capture worker; it is not yet
-fed by live cameras.
+**Current status (v2.2.0):** ``scripts/run_live_ws.py`` feeds four RTSP
+workers into ``TimestampRingBuffer`` (pose on cam_01–03, ball on cam_04).
+Offline validation still uses ``finalize_action_from_session`` on disk sessions.
+Live WebSocket emits one JSON per finalized action (plus ``timeline_gap``).
 """
 
 from __future__ import annotations

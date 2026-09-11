@@ -102,5 +102,38 @@ def compute_h36m_angles(
     return _apply_shooting_side(out, shooting_hand)
 
 
+# WS / dashboard 关节角键；缺测为 null（JSON），计算侧为 NaN
+ANGLE_KEYS = (
+    "right_elbow",
+    "left_elbow",
+    "right_knee",
+    "left_knee",
+    "right_wrist",
+    "shooting_elbow",
+    "shooting_wrist",
+)
+
+
+def finite_or_none(value: float | None) -> float | None:
+    if value is None:
+        return None
+    try:
+        v = float(value)
+    except (TypeError, ValueError):
+        return None
+    if v != v:  # NaN
+        return None
+    return v
+
+
+def pack_angle_row(t_ms: float, angles: dict[str, float] | None) -> dict[str, float | None]:
+    """One WS angles[] element: t_ms + ANGLE_KEYS (missing → null)."""
+    src = angles or {}
+    row: dict[str, float | None] = {"t_ms": float(t_ms)}
+    for key in ANGLE_KEYS:
+        row[key] = finite_or_none(src.get(key))
+    return row
+
+
 def compute_series_angles(frames: list[np.ndarray]) -> list[dict[str, float]]:
     return [compute_frame_angles(f) for f in frames]
