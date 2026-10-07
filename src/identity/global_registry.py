@@ -92,6 +92,34 @@ def face_match_score(
     return w * c_sim + (1.0 - w) * m_sim
 
 
+@dataclass
+class _MatchOperand:
+    """One side of face_match_score(), prepared once and reused across pairs."""
+
+    centroid: np.ndarray | None
+    samples: np.ndarray | None  # (n, d) rows l2-normalised as in mutual_best_mean
+
+
+def _match_operand(embs: list[np.ndarray]) -> _MatchOperand:
+    kept = consensus_filter_faces(embs)
+    c = _centroid(kept)
+    if c is None:
+        return _MatchOperand(None, None)
+    return _MatchOperand(c, np.stack([_l2_normalize(e) for e in kept], axis=0))
+
+
+def _operand_match_score(q: _MatchOperand, g: _MatchOperand, centroid_weight: float) -> float:
+    """face_match_score() on prepared operands (cosines in one matrix product)."""
+    if q.centroid is None or g.centroid is None:
+        return 0.0
+    c_sim = float(cosine_sim(q.centroid, g.centroid))
+    norms = np.outer(np.linalg.norm(q.samples, axis=1), np.linalg.norm(g.samples, axis=1))
+    sims = (q.samples @ g.samples.T) / (norms + 1e-8)
+    m_sim = 0.5 * (float(np.mean(sims.max(axis=1))) + float(np.mean(sims.max(axis=0))))
+    w = float(np.clip(centroid_weight, 0.0, 1.0))
+    return w * c_sim + (1.0 - w) * m_sim
+
+
 def get_global_registry_config() -> dict[str, Any]:
     try:
         cam = load_yaml("cameras.yaml")
@@ -159,6 +187,8 @@ class GlobalFaceRegistry:
         }
         self._centroids: dict[str, np.ndarray] = {}
         self._sample_bank: dict[str, list[np.ndarray]] = {}
+        # gid -> (bank list it was built from, prepared operand)
+        self._operands: dict[str, tuple[list[np.ndarray], _MatchOperand]] = {}
         self.load()
 
     def load(self) -> None:
@@ -265,11 +295,19 @@ class GlobalFaceRegistry:
         )
         cw = float(self.cfg.get("centroid_weight", 0.5))
 
+        # Same score as face_match_score(q_filt, gal), but the query side is
+        # prepared once and each gallery side once per bank update, instead of
+        # re-filtering both for every (query, global id) pair.
+        query = _match_operand(q_filt)
         scores: list[tuple[str, float]] = []
         for gid, gal in self._sample_bank.items():
             if not gal:
                 continue
-            scores.append((gid, face_match_score(q_filt, gal, centroid_weight=cw)))
+            cached = self._operands.get(gid)
+            if cached is None or cached[0] is not gal:
+                cached = (gal, _match_operand(gal))
+                self._operands[gid] = cached
+            scores.append((gid, _operand_match_score(query, cached[1], cw)))
         scores.sort(key=lambda x: x[1], reverse=True)
 
         if not scores:
