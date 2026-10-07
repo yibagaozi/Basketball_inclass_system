@@ -7,6 +7,9 @@ sustained dominant presentations, and write multi-sample galleries.
 
 from __future__ import annotations
 
+import queue
+import threading
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -17,7 +20,12 @@ import numpy as np
 from src.cameras.registry import get_perception_config
 from src.config import load_models_config, model_path
 from src.identity.clothing_color import clothing_color_similarity, extract_clothing_color
-from src.identity.embedders import create_body_embedder, create_face_embedder
+from src.identity.embedders import (
+    BodyEmbedder,
+    FaceEmbedder,
+    create_body_embedder,
+    create_face_embedder,
+)
 from src.identity.enrollment import EnrollmentGallery
 from src.identity.perception import _estimate_face_bbox
 
@@ -73,18 +81,31 @@ def _load_yolo():
     return YOLO(str(model_path(cfg["yolo_pose"]["path"]))), "ultralytics"
 
 
+_raw_pose_model = None
+
+
+def _get_raw_pose_model():
+    """Raw ultralytics YOLO-Pose, loaded once per process.
+
+    It used to be rebuilt for every frame (torch.load + fuse + device upload +
+    warmup), which dominated enrollment time on long captures.
+    """
+    global _raw_pose_model
+    if _raw_pose_model is None:
+        from ultralytics import YOLO
+
+        cfg = load_models_config()
+        _raw_pose_model = YOLO(str(model_path(cfg["yolo_pose"]["path"])))
+    return _raw_pose_model
+
+
 def _detect_persons_pose(backend, kind: str, frame: np.ndarray, score_thr: float) -> list[dict]:
     """Return [{bbox, score, keypoints(17x3)}]."""
     out: list[dict] = []
     if kind == "yolo_pose":
         # Prefer raw ultralytics for keypoints if wrapper lacks them
         try:
-            from ultralytics import YOLO
-            from src.config import load_models_config, model_path as mp
-
-            cfg = load_models_config()
-            model = YOLO(str(mp(cfg["yolo_pose"]["path"])))
-            r = model.predict(frame, verbose=False, conf=score_thr)[0]
+            r = _get_raw_pose_model().predict(frame, verbose=False, conf=score_thr)[0]
         except Exception:
             dets = backend.detect_persons(frame, score_thr=score_thr, best_only=False)
             for d in dets:
@@ -228,25 +249,41 @@ def scan_frontal_candidates(
     return samples
 
 
-def scan_frontal_candidates_from_frames(
-    frames: list[tuple[int, float, np.ndarray]],
-    *,
-    min_area_ratio: float = 0.035,
-    min_frontal: float = 0.40,
-    score_thr: float = 0.35,
-    cx_range: tuple[float, float] = (0.18, 0.82),
-    min_dominance: float = 1.35,
-    closeup_area: float = 0.085,
-    keep_frames: bool = True,
-) -> list[EnrollSample]:
-    """Same frontal scoring as video scan, but over in-memory live frames (no mp4)."""
-    backend, kind = _load_yolo()
-    body = create_body_embedder()
-    samples: list[EnrollSample] = []
-    for i, t, frame in frames:
+class FrontalCandidateScanner:
+    """Frame-by-frame frontal scoring over live frames (no mp4).
+
+    Same scoring as the video scan. Feed frames with :meth:`process` either from
+    an in-memory list or from a capture loop; accepted candidates collect in
+    ``samples``.
+    """
+
+    def __init__(
+        self,
+        *,
+        min_area_ratio: float = 0.035,
+        min_frontal: float = 0.40,
+        score_thr: float = 0.35,
+        cx_range: tuple[float, float] = (0.18, 0.82),
+        min_dominance: float = 1.35,
+        closeup_area: float = 0.085,
+        keep_frames: bool = True,
+        body: BodyEmbedder | None = None,
+    ):
+        self.backend, self.kind = _load_yolo()
+        self.body = body or create_body_embedder()
+        self.min_area_ratio = min_area_ratio
+        self.min_frontal = min_frontal
+        self.score_thr = score_thr
+        self.cx_range = cx_range
+        self.min_dominance = min_dominance
+        self.closeup_area = closeup_area
+        self.keep_frames = keep_frames
+        self.samples: list[EnrollSample] = []
+
+    def process(self, i: int, t: float, frame: np.ndarray) -> EnrollSample | None:
         fh, fw = frame.shape[:2]
         frame_area = float(fh * fw)
-        dets = _detect_persons_pose(backend, kind, frame, score_thr)
+        dets = _detect_persons_pose(self.backend, self.kind, frame, self.score_thr)
         sized: list[tuple[float, dict]] = []
         for d in dets:
             x1, y1, x2, y2 = d["bbox"]
@@ -259,10 +296,10 @@ def scan_frontal_candidates_from_frames(
         for ar, d in sized:
             x1, y1, x2, y2 = d["bbox"]
             cx = 0.5 * (x1 + x2) / fw
-            if ar < min_area_ratio or not (cx_range[0] <= cx <= cx_range[1]):
+            if ar < self.min_area_ratio or not (self.cx_range[0] <= cx <= self.cx_range[1]):
                 continue
             dominance = ar / (second_ar + 1e-6)
-            if ar < closeup_area and dominance < min_dominance:
+            if ar < self.closeup_area and dominance < self.min_dominance:
                 continue
             kp = d.get("keypoints")
             if kp is not None and getattr(kp, "shape", None) is not None and kp.shape[0] >= 17:
@@ -278,15 +315,15 @@ def scan_frontal_candidates_from_frames(
             if best is None or q > best[0]:
                 best = (q, d, ar, fs)
         if best is None:
-            continue
+            return None
         q, d, ar, fs = best
-        if fs < min_frontal or ar < min_area_ratio:
-            continue
+        if fs < self.min_frontal or ar < self.min_area_ratio:
+            return None
         bbox = list(map(float, d["bbox"]))
         kp = d.get("keypoints")
-        emb = body.embed(frame, bbox)
+        emb = self.body.embed(frame, bbox)
         color = extract_clothing_color(frame, bbox, keypoints=kp)
-        samples.append(EnrollSample(
+        sample = EnrollSample(
             frame_idx=int(i),
             timestamp_s=float(t),
             bbox=bbox,
@@ -296,9 +333,90 @@ def scan_frontal_candidates_from_frames(
             body_emb=emb,
             color_desc=color,
             keypoints=kp,
-            frame_bgr=frame.copy() if keep_frames else None,
-        ))
-    return samples
+            # Live frames are private and never modified afterwards: keep a
+            # reference instead of a second ~6 MB copy per 1080p frame.
+            frame_bgr=frame if self.keep_frames else None,
+        )
+        self.samples.append(sample)
+        return sample
+
+
+def scan_frontal_candidates_from_frames(
+    frames: list[tuple[int, float, np.ndarray]],
+    **scan_kwargs: Any,
+) -> list[EnrollSample]:
+    """Same frontal scoring as video scan, but over in-memory live frames (no mp4)."""
+    scanner = FrontalCandidateScanner(**scan_kwargs)
+    for i, t, frame in frames:
+        scanner.process(i, t, frame)
+    return scanner.samples
+
+
+class StreamingFrontalScan:
+    """Score live enrollment frames on a worker thread while capture runs.
+
+    Models load in the background, so capture starts at once; frames without a
+    candidate are dropped as soon as they are scored instead of piling up in
+    memory, and only the queue backlog is left to process when capture stops.
+    """
+
+    def __init__(self, *, preload_face: bool = True, log_every: int = 100, **scan_kwargs: Any):
+        self.face_embedder: FaceEmbedder | None = None
+        self.body_embedder: BodyEmbedder | None = None
+        self.submitted = 0
+        self._scan_kwargs = scan_kwargs
+        self._preload_face = preload_face
+        self._log_every = log_every
+        self._queue: queue.Queue = queue.Queue()
+        self._scanner: FrontalCandidateScanner | None = None
+        self._error: Exception | None = None
+        self._thread = threading.Thread(target=self._run, name="enroll-scan", daemon=True)
+        self._thread.start()
+
+    def submit(self, i: int, t: float, frame: np.ndarray) -> None:
+        self.submitted += 1
+        self._queue.put((i, t, frame))
+
+    def _run(self) -> None:
+        try:
+            self._scanner = FrontalCandidateScanner(**self._scan_kwargs)
+            self.body_embedder = self._scanner.body
+            if self._preload_face:
+                # Needed only when the gallery is written; load it while capture runs.
+                self.face_embedder = create_face_embedder()
+        except Exception as e:
+            self._error = e
+        done = 0
+        while True:
+            item = self._queue.get()
+            if item is None:
+                return
+            if self._error is not None:
+                continue  # keep draining so frames are not held in memory
+            try:
+                self._scanner.process(*item)
+            except Exception as e:
+                self._error = e
+                continue
+            done += 1
+            if self._log_every and done % self._log_every == 0:
+                print(
+                    f"  [live-enroll] scanned {done} frames, "
+                    f"{len(self._scanner.samples)} candidates, backlog {self._queue.qsize()}",
+                    flush=True,
+                )
+
+    def close(self) -> None:
+        """Stop the worker after the queued frames (no error propagation)."""
+        self._queue.put(None)
+        self._thread.join()
+
+    def finish(self) -> list[EnrollSample]:
+        """Wait for the queued frames to be scored; return the candidates."""
+        self.close()
+        if self._error is not None:
+            raise self._error
+        return self._scanner.samples if self._scanner is not None else []
 
 
 def cluster_sequential_enrollments(
@@ -409,12 +527,16 @@ def write_enrollment_gallery(
     *,
     max_samples_per_person: int = 8,
     preview_dir: Path | None = None,
+    face_embedder: FaceEmbedder | None = None,
+    body_embedder: BodyEmbedder | None = None,
 ) -> list[str]:
     """Persist face/body/color samples into EnrollmentGallery; return student_ids."""
     if not people:
         return []
-    gallery = EnrollmentGallery(session_id)
-    face_emb = create_face_embedder()
+    t_start = time.time()
+    face_emb = face_embedder or create_face_embedder()
+    # Share the embedders with the gallery instead of loading a second set of models.
+    gallery = EnrollmentGallery(session_id, face_embedder=face_emb, body_embedder=body_embedder)
     # Reload frames for best samples if not cached (live path keeps frame_bgr)
     cap = None
     src = Path(video_path) if video_path else None
@@ -449,15 +571,14 @@ def write_enrollment_gallery(
             else:
                 continue
             face_bbox = _estimate_face_bbox(s.bbox, frame.shape)
-            # Try real face embed; still store body/color always
+            # Try real face embed; still store body/color always. No retry on a
+            # miss: the gallery shares face_emb, so it would get the same None.
             emb = face_emb.embed(frame, face_bbox)
             if emb is not None:
                 d = gallery.student_dir(person.student_id)
                 idx = len(list(d.glob("face_*.npy")))
                 np.save(d / f"face_{idx:03d}.npy", emb)
                 gallery._cache.pop(person.student_id, None)
-            else:
-                gallery.add_face_sample(person.student_id, frame, face_bbox)
             gallery.add_body_sample(person.student_id, frame, s.bbox)
             gallery.add_clothing_color_sample(
                 person.student_id, frame, s.bbox, keypoints=s.keypoints,
@@ -499,11 +620,17 @@ def write_enrollment_gallery(
 
     if cap is not None:
         cap.release()
+    print(
+        f"  [enroll] gallery: {len(student_ids)} students written in {time.time() - t_start:.1f}s",
+        flush=True,
+    )
     # Cross-session face → global_id; clothing/body stay session-local under stu_XX
     try:
         from src.identity.global_registry import link_session_enrollment_to_global
 
+        t_link = time.time()
         link = link_session_enrollment_to_global(session_id, student_ids, gallery=gallery)
+        print(f"  [enroll] global registry link: {time.time() - t_link:.1f}s", flush=True)
         if link.get("mappings"):
             print(
                 f"  [enroll] global registry: "
@@ -582,6 +709,15 @@ def enroll_sequential_from_video(
     )
 
 
+def live_scan_kwargs(**scan_kwargs: Any) -> dict[str, Any]:
+    """Scanner settings for live enrollment (min area from perception config)."""
+    perc = get_perception_config()
+    min_ar = float(scan_kwargs.pop(
+        "min_area_ratio", max(0.03, float(perc.get("min_person_area_ratio", 0.015))),
+    ))
+    return {**scan_kwargs, "min_area_ratio": min_ar, "keep_frames": True}
+
+
 def enroll_sequential_from_frames(
     session_id: str,
     frames: list[tuple[int, float, np.ndarray]],
@@ -593,16 +729,32 @@ def enroll_sequential_from_frames(
     **scan_kwargs: Any,
 ) -> list[str]:
     """Live sequential frontal enroll from preview frames (no mp4)."""
-    perc = get_perception_config()
-    min_ar = float(scan_kwargs.pop(
-        "min_area_ratio", max(0.03, float(perc.get("min_person_area_ratio", 0.015))),
-    ))
-    samples = scan_frontal_candidates_from_frames(
-        frames,
-        min_area_ratio=min_ar,
-        keep_frames=True,
-        **scan_kwargs,
+    scanner = FrontalCandidateScanner(**live_scan_kwargs(**scan_kwargs))
+    for i, t, frame in frames:
+        scanner.process(i, t, frame)
+    return enroll_sequential_from_samples(
+        session_id,
+        scanner.samples,
+        id_prefix=id_prefix,
+        preview_dir=preview_dir,
+        max_persons=max_persons,
+        expected_persons=expected_persons,
+        body_embedder=scanner.body,
     )
+
+
+def enroll_sequential_from_samples(
+    session_id: str,
+    samples: list[EnrollSample],
+    *,
+    id_prefix: str = "stu",
+    preview_dir: Path | None = None,
+    max_persons: int = 16,
+    expected_persons: int | None = None,
+    face_embedder: FaceEmbedder | None = None,
+    body_embedder: BodyEmbedder | None = None,
+) -> list[str]:
+    """Cluster live candidate samples into students and write the gallery."""
     cluster_max = max(max_persons, (expected_persons or 0) + 4)
     people = cluster_sequential_enrollments(
         samples,
@@ -621,6 +773,12 @@ def enroll_sequential_from_frames(
         people = sorted(people, key=lambda p: p.t0)[:expected_persons]
         for i, p in enumerate(people):
             p.student_id = f"{id_prefix}_{i:02d}"
+    print(f"  [live-enroll] {len(samples)} candidates -> {len(people)} persons", flush=True)
     return write_enrollment_gallery(
-        session_id, people, Path(f"live://{session_id}"), preview_dir=preview_dir,
+        session_id,
+        people,
+        Path(f"live://{session_id}"),
+        preview_dir=preview_dir,
+        face_embedder=face_embedder,
+        body_embedder=body_embedder,
     )

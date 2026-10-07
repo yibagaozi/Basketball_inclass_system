@@ -77,7 +77,12 @@ def try_load_insightface(use_gpu: bool = True):
         except ImportError:
             providers = ["CPUExecutionProvider"]
 
-        app = FaceAnalysis(name="buffalo_l", providers=providers)
+        # Only bbox / det_score / normed_embedding are used: skip the landmark and
+        # gender-age models that FaceAnalysis.get() would otherwise run per face.
+        app = FaceAnalysis(
+            name="buffalo_l", providers=providers,
+            allowed_modules=["detection", "recognition"],
+        )
         ctx_id = 0 if use_gpu and providers[0] == "CUDAExecutionProvider" else -1
         app.prepare(ctx_id=ctx_id, det_size=(640, 640))
         return app
