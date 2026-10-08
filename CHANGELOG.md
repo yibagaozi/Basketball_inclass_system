@@ -1,5 +1,22 @@
 # Changelog
 
+## 2.2.0+enroll.1 — 2026-10-08（增量包）
+
+### 性能（注册）
+- YOLO-Pose 只加载一次（2.2.0 每帧重载）；直播注册改为边采边算，采集结束只剩积压
+- 无候选帧即时释放、候选帧不再复制；InsightFace / OSNet 每次注册只加载一套；人脸只跑检测 + 识别
+- 全局注册表比对：每边只准备一次 + 矩阵乘，决策不变
+- 分阶段耗时日志：models ready / capture done / scan done / gallery / registry
+
+### 新增
+- `run_live_ws.py enroll --video <本地视频>`（`--realtime` 模拟直播）：与直播注册同一流程与产物
+- `scripts/bench_enroll.py`：注册压测（各环节耗时、端到端、GPU 利用率/显存按阶段）
+- 文档：`docs/注册加速与压测.md`；单测：`tests/test_enroll_streaming.py`
+
+### 兼容
+- 产物格式不变；同一组帧上与 2.2.0 结果逐位一致；`enrollment.json` 仅视频注册时多 `source`/`video`
+- `enroll --seconds` 不传时：直播仍为 45 秒，视频处理整段
+
 ## 2.2.0 — 2026-09-11
 
 ### 新增

@@ -31,6 +31,8 @@ python scripts/run_live_ws.py setup --session live_demo
 python scripts/run_live_ws.py sync --session live_demo
 python scripts/run_live_ws.py calibrate --session live_demo
 python scripts/run_live_ws.py enroll --session live_demo --seconds 45
+# 或从本地视频注册（流程与产物同上，见 注册加速与压测.md）
+python scripts/run_live_ws.py enroll --session live_demo --video D:/videos/enroll.mp4 --no-preview
 
 # 推理 + WS（无 DISPLAY 也可）
 python scripts/run_live_ws.py run --session live_demo
