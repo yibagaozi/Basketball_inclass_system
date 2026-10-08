@@ -58,7 +58,8 @@ def detect_court_lines(image: np.ndarray, min_length: float = 60.0) -> list[Line
     segs: list[LineSeg] = []
     if lines is None:
         return segs
-    for row in lines[:, 0]:
+    # OpenCV 4.x returns (N, 1, 4), 5.x returns (N, 4)
+    for row in np.asarray(lines).reshape(-1, 4):
         x1, y1, x2, y2 = map(float, row)
         length = ((x2 - x1) ** 2 + (y2 - y1) ** 2) ** 0.5
         if length < min_length:
