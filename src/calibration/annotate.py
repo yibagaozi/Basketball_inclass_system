@@ -39,27 +39,55 @@ def empty_annotation_doc(camera_ids: list[str]) -> dict[str, Any]:
     }
 
 
-def _map_mouse_to_image(
-    x: int, y: int, win: str, img_w: int, img_h: int,
-) -> tuple[int, int]:
-    """
-    Map HighGUI mouse coords → image pixels when WINDOW_NORMAL is resized.
-    Without this, clicks and drawn markers diverge (common after window resize).
-    """
+View = tuple[float, float, int, int]  # canvas = (ox + sx * u, oy + sy * v)
+
+
+def _window_view_size(win: str) -> tuple[int, int]:
     try:
         _wx, _wy, ww, wh = cv2.getWindowImageRect(win)
     except cv2.error:
-        return int(x), int(y)
-    if ww <= 1 or wh <= 1:
-        return int(x), int(y)
-    if abs(ww - img_w) <= 2 and abs(wh - img_h) <= 2:
-        return max(0, min(img_w - 1, int(x))), max(0, min(img_h - 1, int(y)))
-    # Some backends already report image-space coords (can exceed window size)
-    if x >= ww or y >= wh:
-        return max(0, min(img_w - 1, int(x))), max(0, min(img_h - 1, int(y)))
-    u = int(round(x * img_w / float(ww)))
-    v = int(round(y * img_h / float(wh)))
-    return max(0, min(img_w - 1, u)), max(0, min(img_h - 1, v))
+        return 0, 0
+    return int(ww), int(wh)
+
+
+def _fit_to_view(img: np.ndarray, view_w: int, view_h: int) -> tuple[np.ndarray, View]:
+    """
+    Letterbox img into a view_w × view_h canvas, keeping its aspect ratio.
+
+    WINDOW_NORMAL stretches whatever imshow gets to the window (the Win32
+    backend ignores aspect ratio), so a 1920×1080 frame in a window that is not
+    exactly 16:9 (clamped by display scaling, maximized, dragged) looked
+    distorted. A canvas already the window's size is shown 1:1.
+    """
+    h, w = img.shape[:2]
+    if view_w <= 1 or view_h <= 1:
+        return img, (1.0, 1.0, 0, 0)
+    s = min(view_w / w, view_h / h)
+    dw, dh = max(1, round(w * s)), max(1, round(h * s))
+    ox, oy = (view_w - dw) // 2, (view_h - dh) // 2
+    canvas = np.zeros((view_h, view_w, 3), np.uint8)
+    interp = cv2.INTER_AREA if s < 1 else cv2.INTER_LINEAR
+    canvas[oy:oy + dh, ox:ox + dw] = cv2.resize(img, (dw, dh), interpolation=interp)
+    return canvas, (dw / w, dh / h, ox, oy)
+
+
+def _view_to_image(
+    x: int, y: int, view: View, img_w: int, img_h: int,
+) -> tuple[float, float] | None:
+    """
+    Map mouse-callback coords → image pixels; None for clicks on the letterbox bars.
+
+    For WINDOW_NORMAL every HighGUI backend (Win32 / GTK / Qt) already rescales
+    mouse coords from the window to the shown canvas, so only the letterbox is
+    undone here. Rescaling by image/window once more (as before) put markers
+    ~1.2× farther from the top-left than the click on a 1600×900 window.
+    """
+    sx, sy, ox, oy = view
+    u = (x - ox + 0.5) / sx - 0.5  # pixel-centre convention, same as cv2.resize
+    v = (y - oy + 0.5) / sy - 0.5
+    if not (-0.5 <= u < img_w - 0.5 and -0.5 <= v < img_h - 0.5):
+        return None
+    return min(max(u, 0.0), img_w - 1.0), min(max(v, 0.0), img_h - 1.0)
 
 
 def load_annotations(path: Path) -> dict[str, Any]:
@@ -161,19 +189,28 @@ def annotate_camera_gui(
     }
 
     win = f"annotate {camera_id}"
-    cv2.namedWindow(win, cv2.WINDOW_NORMAL)
-    # Keep aspect; start near native size so mouse↔pixel stay 1:1 until user resizes
+    # FREERATIO: show() keeps the aspect itself; Qt's KEEPRATIO would resize the view
+    # to each canvas and the canvas follows the view (feedback, view shrinks)
+    cv2.namedWindow(win, cv2.WINDOW_NORMAL | cv2.WINDOW_FREERATIO)
+    # Start at ≤1600×900 with the image's aspect; later sizes are letterboxed by show()
+    s0 = min(1.0, 1600 / w, 900 / h)
     try:
-        cv2.resizeWindow(win, min(w, 1600), min(h, 900))
+        cv2.resizeWindow(win, round(w * s0), round(h * s0))
     except cv2.error:
         pass
+    view: list[View] = [(1.0, 1.0, 0, 0)]  # transform of the canvas on screen (read by on_mouse)
+
+    def show(img: np.ndarray) -> None:
+        canvas, view[0] = _fit_to_view(img, *_window_view_size(win))
+        cv2.imshow(win, canvas)
+
     # Show loading tip while Hough runs (~1–2s) so UI never looks dead
     boot = img0.copy()
     banner = draw_hud_banner(w, [f"{camera_id} 正在检测球场线，请稍候…"], font_size=24)
     boot[: banner.shape[0]] = cv2.addWeighted(
         boot[: banner.shape[0]], 0.35, banner, 0.65, 0,
     )
-    cv2.imshow(win, boot)
+    show(boot)
     cv2.waitKey(1)
 
     segs = detect_court_lines(img0)
@@ -193,14 +230,16 @@ def annotate_camera_gui(
             break
 
     # Mouse only queues clicks; all logic runs in the main loop (avoids HighGUI stalls)
-    pending_click: tuple[int, int, bool] | None = None  # x, y, shift_snap
+    pending_click: tuple[float, float, bool] | None = None  # x, y, shift_snap
 
     def on_mouse(event, x, y, flags, param):
         nonlocal pending_click
         if event == cv2.EVENT_LBUTTONDOWN:
-            u, v = _map_mouse_to_image(int(x), int(y), win, w, h)
+            uv = _view_to_image(int(x), int(y), view[0], w, h)
+            if uv is None:  # on the letterbox bars
+                return
             shift = bool(flags & cv2.EVENT_FLAG_SHIFTKEY)
-            pending_click = (u, v, shift)
+            pending_click = (uv[0], uv[1], shift)
 
     cv2.setMouseCallback(win, on_mouse)
 
@@ -288,7 +327,7 @@ def annotate_camera_gui(
         vis[:bh] = cv2.addWeighted(vis[:bh], 0.30, banner, 0.70, 0)
 
         cv2.setWindowTitle(win, f"{camera_id} {done_n}/{len(order)} — {name}")
-        cv2.imshow(win, vis)
+        show(vis)
 
         key = cv2.waitKeyEx(15)
         if key < 0:
@@ -314,7 +353,7 @@ def annotate_camera_gui(
                 status = "当前点尚未标注，无需删除"
         elif key8 in (ord("a"), ord("A")):
             status = "自动补全中…"
-            cv2.imshow(win, vis)
+            show(vis)
             cv2.waitKey(1)
             pts = auto_fill_from_seeds(img0, pts, model=model, target_ids=order)
             persist()
