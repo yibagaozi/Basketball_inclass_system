@@ -38,6 +38,7 @@ from src.streaming.live_config import (  # noqa: E402
     rtsp_urls,
     websocket_bind,
 )
+from src.streaming.edge_ws_client import EdgeWsClient
 
 
 def _session_id(args: argparse.Namespace) -> str:
@@ -171,9 +172,12 @@ def cmd_run(args: argparse.Namespace) -> None:
     if args.port:
         port = int(args.port)
     jsonl = live_dir / "events.jsonl"
-    hub = WsHub(host, port, jsonl_path=jsonl)
+    edge_url = "ws://127.0.0.1:8081/internal/cv/stream"
+    hub = EdgeWsClient(edge_url, jsonl_path=jsonl)
+    # hub = WsHub(host, port, jsonl_path=jsonl)
     hub.start_background()
-    print(f"WebSocket ws://{host}:{port}  jsonl={jsonl}", flush=True)
+    print(f"edge {edge_url} jsonl {jsonl}, flush=true")
+    # print(f"WebSocket ws://{host}:{port}  jsonl={jsonl}", flush=True)
 
     engine = LiveEngine(
         sid,

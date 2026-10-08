@@ -154,7 +154,7 @@ def main():
 
     try:
         reid = cfg["body_reid"]
-        dest = MODELS / reid["path"]
+        dest = ROOT / reid["path"]
         if dest.exists():
             print(f"[skip] {reid['name']}")
         else:

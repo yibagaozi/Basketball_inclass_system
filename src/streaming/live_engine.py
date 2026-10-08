@@ -59,18 +59,26 @@ class LiveEngine:
         self._emitted: list[dict[str, Any]] = []
         self._stop = threading.Event()
         self._lock = threading.Lock()
+        # Capture threads only hand off the newest frame; inference runs elsewhere.
+        self._latest: dict[str, LiveFrame | None] = {c: None for c in CAMS}
+        self._latest_lock = threading.Lock()
+        self._processed = {c: 0 for c in CAMS}
+        self._dropped = {c: 0 for c in CAMS}
+        self._infer_threads: list[threading.Thread] = []
+        self._last_report = 0.0
 
         def on_gap(ev: dict[str, Any]) -> None:
             ev["session_id"] = self.session_id
             self.hub.publish(ev)
 
         def on_frame(fr: LiveFrame) -> None:
+            """Capture-thread hot path: keep only the newest frame, never block."""
             if self._stop.is_set():
                 return
-            try:
-                self.perception.process(fr)
-            except Exception as exc:
-                print(f"  [live] {fr.camera_id} perception: {exc}", flush=True)
+            with self._latest_lock:
+                if self._latest[fr.camera_id] is not None:
+                    self._dropped[fr.camera_id] += 1
+                self._latest[fr.camera_id] = fr
 
         self.capture = MultiRtspCapture(
             urls,
@@ -84,11 +92,36 @@ class LiveEngine:
             on_frame=on_frame,
         )
 
+    def _infer_loop(self, camera_id: str) -> None:
+        """One worker per camera: always take the newest frame, skip the backlog."""
+        while not self._stop.is_set():
+            with self._latest_lock:
+                fr = self._latest[camera_id]
+                self._latest[camera_id] = None
+            if fr is None:
+                time.sleep(0.003)
+                continue
+            try:
+                self.perception.process(fr)
+                self._processed[camera_id] += 1
+            except Exception as exc:
+                print(f"  [live] {camera_id} perception: {exc}", flush=True)
+
     def _finalize_loop(self) -> None:
         pose_ring = self.rings["cam_03"]
         ball_ring = self.rings["cam_04"]
         while not self._stop.is_set():
             time.sleep(0.35)
+            if time.time() - self._last_report >= 5.0:
+                self._last_report = time.time()
+                print(
+                    "  [live] " + "  ".join(
+                        f"{c} ring={len(self.rings[c])} ok={self._processed[c]}"
+                        f" drop={self._dropped[c]}"
+                        for c in CAMS
+                    ),
+                    flush=True,
+                )
             if len(pose_ring) < 20:
                 continue
             try:
@@ -141,6 +174,14 @@ class LiveEngine:
                 self.hub.publish(msg)
 
     def start(self) -> None:
+        self.perception._ensure_id_models()  # load once, not on the first frame
+        for cam in CAMS:
+            t = threading.Thread(
+                target=self._infer_loop, args=(cam,),
+                name=f"live-infer-{cam}", daemon=True,
+            )
+            t.start()
+            self._infer_threads.append(t)
         self.capture.start()
         self._fin_thread = threading.Thread(
             target=self._finalize_loop, name="live-finalize", daemon=True,
