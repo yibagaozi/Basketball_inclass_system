@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 from functools import lru_cache
 from pathlib import Path
 from typing import Sequence
@@ -10,11 +11,26 @@ import cv2
 import numpy as np
 from PIL import Image, ImageDraw, ImageFont
 
+_WIN_FONTS = Path(os.environ.get("WINDIR", "C:/Windows")) / "Fonts"
+# Without a CJK font PIL falls back to a 10 px Latin font and every Chinese
+# character in the HUD (e.g. which landmark to click) is drawn as a box.
 _FONT_CANDIDATES = [
+    # Linux
     Path("/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc"),
     Path("/usr/share/fonts/truetype/droid/DroidSansFallbackFull.ttf"),
     Path("/usr/share/fonts/truetype/wqy/wqy-microhei.ttc"),
     Path("/usr/share/fonts/truetype/arphic/uming.ttc"),
+    # macOS
+    Path("/System/Library/Fonts/PingFang.ttc"),
+    Path("/System/Library/Fonts/Hiragino Sans GB.ttc"),
+    Path("/System/Library/Fonts/STHeiti Medium.ttc"),
+    Path("/System/Library/Fonts/STHeiti Light.ttc"),
+    Path("/System/Library/Fonts/Supplemental/Arial Unicode.ttf"),
+    Path("/Library/Fonts/Arial Unicode.ttf"),
+    # Windows
+    _WIN_FONTS / "msyh.ttc",
+    _WIN_FONTS / "simhei.ttf",
+    _WIN_FONTS / "simsun.ttc",
 ]
 
 
