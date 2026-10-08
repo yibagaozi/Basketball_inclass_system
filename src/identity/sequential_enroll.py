@@ -358,16 +358,27 @@ class StreamingFrontalScan:
     Models load in the background, so capture starts at once; frames without a
     candidate are dropped as soon as they are scored instead of piling up in
     memory, and only the queue backlog is left to process when capture stops.
+
+    ``max_queue`` > 0 makes :meth:`submit` block when that many frames are
+    waiting (for file sources read faster than real time); 0 never blocks, as a
+    live camera must not stall.
     """
 
-    def __init__(self, *, preload_face: bool = True, log_every: int = 100, **scan_kwargs: Any):
+    def __init__(
+        self,
+        *,
+        preload_face: bool = True,
+        log_every: int = 100,
+        max_queue: int = 0,
+        **scan_kwargs: Any,
+    ):
         self.face_embedder: FaceEmbedder | None = None
         self.body_embedder: BodyEmbedder | None = None
         self.submitted = 0
         self._scan_kwargs = scan_kwargs
         self._preload_face = preload_face
         self._log_every = log_every
-        self._queue: queue.Queue = queue.Queue()
+        self._queue: queue.Queue = queue.Queue(maxsize=max(0, max_queue))
         self._scanner: FrontalCandidateScanner | None = None
         self._error: Exception | None = None
         self._thread = threading.Thread(target=self._run, name="enroll-scan", daemon=True)

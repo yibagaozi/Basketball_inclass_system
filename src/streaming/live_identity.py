@@ -1,4 +1,4 @@
-"""Live sequential enrollment from RTSP preview (no mp4)."""
+"""Sequential enrollment from the RTSP preview (no mp4) or from a local video file."""
 
 from __future__ import annotations
 
@@ -79,6 +79,67 @@ def collect_enroll_frames(
     return frames
 
 
+def collect_video_frames(
+    path: str | Path,
+    *,
+    on_frame: Callable[[int, float, Any], None],
+    sample_hz: float = 8.0,
+    max_seconds: float | None = None,
+    realtime: bool = False,
+    preview: bool = False,
+    window_title: str = "video enroll — Q 结束",
+) -> int:
+    """Sample a local video on its own timeline (not the wall clock).
+
+    Same keep rule as the live sampler, with ``t = frame_index / fps``; frames in
+    between are only grabbed. ``realtime`` paces reading at the native fps, like
+    a camera. Returns the number of frames handed to ``on_frame``.
+    """
+    cap = cv2.VideoCapture(str(path))
+    if not cap.isOpened():
+        raise RuntimeError(f"无法打开视频：{path}")
+    fps = float(cap.get(cv2.CAP_PROP_FPS) or 0.0)
+    if not 0.0 < fps < 1000.0:
+        fps = 25.0
+    show = preview and has_display()
+    interval = 1.0 / max(sample_hz, 0.5)
+    last_keep = -1e9
+    idx = n_kept = 0
+    wall0 = time.time()
+    try:
+        while True:
+            t = idx / fps
+            if max_seconds is not None and t >= max_seconds:
+                break
+            if not cap.grab():
+                break
+            if realtime:
+                delay = wall0 + t - time.time()
+                if delay > 0:
+                    time.sleep(delay)
+            if t - last_keep >= interval:
+                ok, fr = cap.retrieve()
+                if ok and fr is not None:
+                    on_frame(idx, t, fr.copy())
+                    n_kept += 1
+                    last_keep = t
+                    if show:
+                        vis = fr.copy()
+                        cv2.putText(
+                            vis, f"t={t:.1f}s  n={n_kept}  Q=quit",
+                            (20, 40), cv2.FONT_HERSHEY_SIMPLEX, 0.9, (0, 255, 0), 2,
+                        )
+                        cv2.imshow(window_title, vis)
+                        if (cv2.waitKey(1) & 0xFF) in (ord("q"), ord("Q"), 27):
+                            break
+            idx += 1
+    finally:
+        cap.release()
+        if show:
+            cv2.destroyWindow(window_title)
+    return n_kept
+
+
 def enroll_live(
     session_id: str,
     url: str,
@@ -100,6 +161,41 @@ def enroll_live(
     except BaseException:
         scan.close()
         raise
+    return _finish_enrollment(scan, session_id, expected_persons, preview_dir)
+
+
+def enroll_from_video(
+    session_id: str,
+    path: str | Path,
+    *,
+    sample_hz: float = 8.0,
+    max_seconds: float | None = None,
+    realtime: bool = False,
+    preview: bool = False,
+    expected_persons: int | None = None,
+    preview_dir: Path | None = None,
+) -> list[str]:
+    """Same enrollment as :func:`enroll_live`, fed from a local video file."""
+    # Faster than real time, decoding must wait for the scorer rather than
+    # queue the whole video in memory; in real-time mode it behaves like a camera.
+    scan = StreamingFrontalScan(max_queue=0 if realtime else 32, **live_scan_kwargs())
+    try:
+        collect_video_frames(
+            path, on_frame=scan.submit, sample_hz=sample_hz, max_seconds=max_seconds,
+            realtime=realtime, preview=preview,
+        )
+    except BaseException:
+        scan.close()
+        raise
+    return _finish_enrollment(scan, session_id, expected_persons, preview_dir)
+
+
+def _finish_enrollment(
+    scan: StreamingFrontalScan,
+    session_id: str,
+    expected_persons: int | None,
+    preview_dir: Path | None,
+) -> list[str]:
     t_capture = time.time()
     print(f"  [live-enroll] capture done: {scan.submitted} frames", flush=True)
     if not scan.submitted:

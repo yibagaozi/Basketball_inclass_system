@@ -5,7 +5,7 @@
 ------
   sync       开课人工同步 GUI → camera_time_offsets_ms（锚点 cam_03=0）
   calibrate  从四路各抽一帧 → 标注+solve（本堂目录，默认不覆盖 v2/v3）
-  enroll     注册机位直播预览，正面顺序注册（不落 mp4）
+  enroll     注册机位直播预览，正面顺序注册（不落 mp4）；--video 改从本地视频注册
   run        拉流推理，动作 finalize 时广播一条 JSON；断流重连沿用启动 offsets
   setup      sync → calibrate → enroll（需 DISPLAY）
 
@@ -116,25 +116,43 @@ def cmd_calibrate(args: argparse.Namespace) -> None:
 
 
 def cmd_enroll(args: argparse.Namespace) -> None:
-    from src.streaming.live_identity import enroll_live
+    from src.streaming.live_identity import enroll_from_video, enroll_live
 
     sid = _session_id(args)
-    urls = _urls(args)
     cam = args.enroll_camera or enroll_camera()
-    url = urls.get(cam) or ""
     preview_dir = _live_dir(sid) / "enroll_preview"
-    ids = enroll_live(
-        sid,
-        url,
-        seconds=float(args.seconds),
-        sample_hz=float(args.sample_hz),
-        preview=not args.no_preview,
-        expected_persons=args.expected_persons,
-        preview_dir=preview_dir,
-    )
+    video = getattr(args, "video", None)
+    doc = {"session_id": sid}
+    if video:
+        path = Path(video)
+        if not path.is_file():
+            raise SystemExit(f"找不到视频文件：{path}")
+        ids = enroll_from_video(
+            sid,
+            path,
+            sample_hz=float(args.sample_hz),
+            max_seconds=None if args.seconds is None else float(args.seconds),
+            realtime=bool(getattr(args, "realtime", False)),
+            preview=not args.no_preview,
+            expected_persons=args.expected_persons,
+            preview_dir=preview_dir,
+        )
+        doc_source = {"source": "video", "video": str(path.resolve())}
+    else:
+        url = _urls(args).get(cam) or ""
+        ids = enroll_live(
+            sid,
+            url,
+            seconds=45.0 if args.seconds is None else float(args.seconds),
+            sample_hz=float(args.sample_hz),
+            preview=not args.no_preview,
+            expected_persons=args.expected_persons,
+            preview_dir=preview_dir,
+        )
+        doc_source = {}
     meta = _live_dir(sid) / "enrollment.json"
     meta.write_text(
-        json.dumps({"session_id": sid, "student_ids": ids, "enroll_camera": cam}, ensure_ascii=False, indent=2),
+        json.dumps({**doc, "student_ids": ids, "enroll_camera": cam, **doc_source}, ensure_ascii=False, indent=2),
         encoding="utf-8",
     )
     print(f"enroll → {ids}  {meta}", flush=True)
@@ -237,13 +255,17 @@ def main() -> None:
     s.add_argument("--grab-only", action="store_true")
     s.set_defaults(func=cmd_calibrate)
 
-    s = sub.add_parser("enroll", help="直播正面顺序注册")
+    s = sub.add_parser("enroll", help="直播正面顺序注册（--video 从本地视频注册）")
     _add_common(s)
     s.add_argument("--enroll-camera", default=None)
-    s.add_argument("--seconds", type=float, default=45.0)
+    s.add_argument("--seconds", type=float, default=None,
+                   help="直播采集时长（默认 45）；--video 时只处理前 N 秒（默认整段）")
     s.add_argument("--sample-hz", type=float, default=float((cfg.get("identity") or {}).get("enroll_sample_hz") or 8))
     s.add_argument("--expected-persons", type=int, default=None)
     s.add_argument("--no-preview", action="store_true")
+    s.add_argument("--video", default=None, help="本地视频文件：代替注册机位直播，流程与产物同直播注册")
+    s.add_argument("--realtime", action="store_true",
+                   help="配合 --video：按视频帧率实时回放（模拟直播采集；默认尽快处理）")
     s.set_defaults(func=cmd_enroll)
 
     s = sub.add_parser("run", help="推理 + WebSocket")

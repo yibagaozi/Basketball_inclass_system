@@ -74,3 +74,36 @@ def test_streaming_scan_reraises_worker_error(stub_models, monkeypatch):
         scan.submit(*f)
     with pytest.raises(RuntimeError, match="detector failed"):
         scan.finish()
+
+
+def _write_video(path, n_frames: int, fps: float = 15.0) -> None:
+    import cv2
+
+    w = cv2.VideoWriter(str(path), cv2.VideoWriter_fourcc(*"MJPG"), fps, (64, 48))
+    for i in range(n_frames):
+        w.write(np.full((48, 64, 3), i * 5 % 255, np.uint8))
+    w.release()
+
+
+def test_video_sampling_follows_video_timeline(tmp_path):
+    from src.streaming.live_identity import collect_video_frames
+
+    video = tmp_path / "enroll.avi"
+    _write_video(video, 45)  # 3 s at 15 fps
+    got: list[tuple[int, float]] = []
+    n = collect_video_frames(video, on_frame=lambda i, t, fr: got.append((i, t)), sample_hz=8.0)
+    # 15 fps sampled at 8 Hz keeps every 2nd frame (same rule as the live sampler)
+    assert n == len(got) == 23
+    assert [i for i, _ in got] == list(range(0, 45, 2))
+    assert got[1][1] == pytest.approx(2 / 15)
+
+    got.clear()
+    collect_video_frames(video, on_frame=lambda i, t, fr: got.append((i, t)), sample_hz=8.0, max_seconds=1.0)
+    assert max(t for _, t in got) < 1.0
+
+
+def test_video_missing_file_raises(tmp_path):
+    from src.streaming.live_identity import collect_video_frames
+
+    with pytest.raises(RuntimeError):
+        collect_video_frames(tmp_path / "missing.mp4", on_frame=lambda *a: None)
