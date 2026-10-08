@@ -23,6 +23,8 @@ from src.identity.clothing_color import clothing_color_similarity, extract_cloth
 from src.identity.embedders import (
     BodyEmbedder,
     FaceEmbedder,
+    StubBodyEmbedder,
+    StubFaceEmbedder,
     create_body_embedder,
     create_face_embedder,
 )
@@ -270,6 +272,11 @@ class FrontalCandidateScanner:
         body: BodyEmbedder | None = None,
     ):
         self.backend, self.kind = _load_yolo()
+        if self.kind == "yolo_pose":
+            try:
+                _get_raw_pose_model()  # load now, not on the first frame
+            except Exception:
+                pass  # _detect_persons_pose falls back to the wrapper
         self.body = body or create_body_embedder()
         self.min_area_ratio = min_area_ratio
         self.min_frontal = min_frontal
@@ -375,6 +382,8 @@ class StreamingFrontalScan:
         self.face_embedder: FaceEmbedder | None = None
         self.body_embedder: BodyEmbedder | None = None
         self.submitted = 0
+        self.models_ready_s: float | None = None  # seconds from start until models loaded
+        self._t_start = time.time()
         self._scan_kwargs = scan_kwargs
         self._preload_face = preload_face
         self._log_every = log_every
@@ -395,6 +404,13 @@ class StreamingFrontalScan:
             if self._preload_face:
                 # Needed only when the gallery is written; load it while capture runs.
                 self.face_embedder = create_face_embedder()
+            self.models_ready_s = time.time() - self._t_start
+            print(f"  [live-enroll] models ready in {self.models_ready_s:.1f}s", flush=True)
+            stubs = [type(m).__name__ for m in (self.body_embedder, self.face_embedder)
+                     if isinstance(m, (StubBodyEmbedder, StubFaceEmbedder))]
+            if stubs:
+                print(f"  [live-enroll] WARNING: 模型未加载，使用占位嵌入器 {stubs}，注册结果不可用"
+                      "（检查 models/reid 权重与 ~/.insightface/models/buffalo_l）", flush=True)
         except Exception as e:
             self._error = e
         done = 0

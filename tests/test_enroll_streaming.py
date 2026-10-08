@@ -44,7 +44,7 @@ def stub_models(monkeypatch):
     monkeypatch.setattr(se, "create_face_embedder", StubFaceEmbedder)
 
 
-def test_streaming_scan_matches_batch(stub_models):
+def test_streaming_scan_matches_batch(stub_models, capsys):
     frames = _frames()
     batch = se.scan_frontal_candidates_from_frames(frames, **se.live_scan_kwargs())
 
@@ -62,6 +62,7 @@ def test_streaming_scan_matches_batch(stub_models):
     assert scan.submitted == len(frames)
     assert isinstance(scan.body_embedder, StubBodyEmbedder)
     assert isinstance(scan.face_embedder, StubFaceEmbedder)
+    assert "WARNING" in capsys.readouterr().out  # stub models are called out in the enroll log
 
 
 def test_streaming_scan_reraises_worker_error(stub_models, monkeypatch):
