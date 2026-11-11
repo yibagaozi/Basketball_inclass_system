@@ -553,6 +553,95 @@ def clothing_color_match_info(
     }
 
 
+def clothing_color_match_batch(
+    a: np.ndarray | None,
+    gallery: np.ndarray,
+    gallery_ok: np.ndarray,
+    part_weights: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray]:
+    """
+    ``clothing_color_match_info(a, gallery[m], part_weights=part_weights[m])`` for all m
+    at once → (similarity (M,) float64, shoe_decisive (M,) bool).
+
+    Bit-identical to the scalar function: same float64 formulas, part sims rounded
+    to float32 as there, and every sum taken left to right over the valid parts
+    (NumPy reduces short rows sequentially too). The live tracker calls this once
+    per detection instead of ~240 scalar calls (30 students x 8 samples).
+
+    gallery:      (M, N_PARTS, 3) float32, rows already normalized by ``_as_parts``
+    gallery_ok:   (M,) bool, False where ``_as_parts`` returned None (→ empty result)
+    part_weights: (M, N_PARTS) float32 per-sample weights (ones when there is no prior)
+    """
+    m = int(gallery.shape[0])
+    similarity = np.zeros(m, dtype=np.float64)
+    shoe_decisive = np.zeros(m, dtype=bool)
+    aa = _as_parts(a)
+    if aa is None or m == 0:
+        return similarity, shoe_decisive
+
+    valid = (
+        (np.abs(aa).sum(axis=1) >= 1e-3)[None, :]
+        & (np.abs(gallery).sum(axis=2) >= 1e-3)
+        & np.asarray(gallery_ok, dtype=bool)[:, None]
+    )  # (M, N_PARTS)
+
+    a64 = aa.astype(np.float64)[None, :, :]
+    g64 = gallery.astype(np.float64)
+    d = np.abs(a64 - g64)
+    dh = np.minimum(d[:, :, 0], 180.0 - d[:, :, 0])
+    ds = d[:, :, 1] / 255.0
+    dv = d[:, :, 2] / 255.0
+    sim = 1.0 - (0.50 * (dh / 90.0) + 0.25 * ds + 0.25 * dv)
+    shoe = 1.0 - (0.20 * (dh / 90.0) + 0.30 * ds + 0.55 * dv)
+    sim[:, SHOE_IDX] = shoe[:, SHOE_IDX]
+    ps = np.clip(sim, 0.0, 1.0).astype(np.float32).astype(np.float64)  # float(part_sims[i])
+    w = np.asarray(part_weights, dtype=np.float32).astype(np.float64)
+
+    # cloth_sim = np.average(valid cloth sims, weights) / np.mean / 0.0
+    num = np.zeros(m)
+    den = np.zeros(m)
+    plain = np.zeros(m)
+    n_cloth = np.zeros(m)
+    for i in CLOTH_IDX:
+        v = valid[:, i]
+        num = np.where(v, num + ps[:, i] * w[:, i], num)
+        den = np.where(v, den + w[:, i], den)
+        plain = np.where(v, plain + ps[:, i], plain)
+        n_cloth = n_cloth + v
+    with np.errstate(divide="ignore", invalid="ignore"):
+        cloth_sim = np.where(
+            n_cloth > 0,
+            np.where(den > 1e-8, num / den, plain / np.maximum(n_cloth, 1)),
+            0.0,
+        )
+
+    shoe_ok = valid[:, SHOE_IDX]
+    shoe_sim = ps[:, SHOE_IDX]
+    valid_w = np.zeros(m)
+    wsum = np.zeros(m)
+    total = np.zeros(m)
+    for i in range(N_PARTS):
+        v = valid[:, i]
+        valid_w = np.where(v, valid_w + w[:, i], valid_w)
+        total = np.where(v, total + w[:, i] * ps[:, i], total)
+    wsum = valid_w
+    shoe_frac = np.where(shoe_ok, w[:, SHOE_IDX], 0.0)
+    with np.errstate(divide="ignore", invalid="ignore"):
+        shoe_frac = np.where(valid_w > 1e-8, shoe_frac / valid_w, shoe_frac)
+        similarity = np.where(
+            valid.any(axis=1) & (wsum > 1e-6),
+            np.clip(total / wsum, 0.0, 1.0),
+            0.0,
+        )
+    shoe_decisive = (
+        shoe_ok
+        & (shoe_frac >= 0.28)
+        & (cloth_sim >= 0.78)
+        & ((cloth_sim - shoe_sim) >= 0.08)
+    )
+    return similarity, shoe_decisive
+
+
 def clothing_color_similarity(
     a: np.ndarray | None,
     b: np.ndarray | None,

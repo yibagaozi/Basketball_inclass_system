@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import threading
 from pathlib import Path
 from typing import Any
 
@@ -66,6 +67,17 @@ def _resolve_device() -> str:
         return "cpu"
 
 
+def _to_numpy(t) -> np.ndarray:
+    """ultralytics tensor (CUDA or CPU) or array → numpy, in one transfer."""
+    if hasattr(t, "detach"):
+        t = t.detach()
+    if hasattr(t, "cpu"):
+        t = t.cpu()
+    if hasattr(t, "numpy"):
+        return t.numpy()
+    return np.asarray(t)
+
+
 class YoloBallHoopDetector:
     """Single YOLO model shared for basketball and hoop."""
 
@@ -87,15 +99,19 @@ class YoloBallHoopDetector:
         self.device = device or _resolve_device()
         self._cfg = cfg
         self._model = None
+        self._load_lock = threading.Lock()
         self._ball_id, self._hoop_id = _numeric_ball_hoop_ids(self.model_file, cfg)
 
     def _ensure_model(self):
         if self._model is not None:
             return
-        if not self.model_file.exists():
-            raise FileNotFoundError(f"Ball/hoop YOLO model not found: {self.model_file}")
-        from ultralytics import YOLO
-        self._model = YOLO(str(self.model_file))
+        with self._load_lock:
+            if self._model is not None:
+                return
+            if not self.model_file.exists():
+                raise FileNotFoundError(f"Ball/hoop YOLO model not found: {self.model_file}")
+            from ultralytics import YOLO
+            self._model = YOLO(str(self.model_file))
 
     def detect(
         self,
@@ -132,11 +148,15 @@ class YoloBallHoopDetector:
             boxes = result.boxes
             if boxes is None:
                 continue
-            for box in boxes:
-                x1, y1, x2, y2 = map(int, box.xyxy[0])
+            # One device→host copy per tensor per frame (was 3 synced copies per box)
+            xyxy_all = _to_numpy(boxes.xyxy)
+            conf_all = _to_numpy(boxes.conf)
+            cls_all = _to_numpy(boxes.cls)
+            for b in range(len(conf_all)):
+                x1, y1, x2, y2 = map(int, xyxy_all[b])
                 w, h = x2 - x1, y2 - y1
-                conf = float(box.conf[0])
-                cls_id = int(box.cls[0])
+                conf = float(conf_all[b])
+                cls_id = int(cls_all[b])
                 cls_name = str(names.get(cls_id, cls_id))
                 cy = y1 + h / 2
                 det = {

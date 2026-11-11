@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import threading
 from pathlib import Path
 
 import cv2
@@ -19,27 +20,50 @@ from src.types import ConsentScope
 
 _rtmlib_backend = None
 _yolo_pose_backend = None
+# Live calls these from several camera threads at once: create each backend once.
+_BACKEND_LOCK = threading.Lock()
+# Why a backend is unavailable (reported once; LivePerception.preload shows it)
+BACKEND_ERRORS: dict[str, str] = {}
+
+
+def _note_backend_error(name: str, reason: str, fallback: str) -> None:
+    if name not in BACKEND_ERRORS:
+        BACKEND_ERRORS[name] = reason
+        print(f"[perception] WARNING: {name} 不可用（{reason}），{fallback}", flush=True)
 
 
 def _get_yolo_pose():
     global _yolo_pose_backend
     if _yolo_pose_backend is None:
-        try:
-            from src.perception.yolo_pose_detector import create_yolo_pose_detector
-            _yolo_pose_backend = create_yolo_pose_detector()
-        except Exception:
-            _yolo_pose_backend = False
+        with _BACKEND_LOCK:
+            if _yolo_pose_backend is None:
+                try:
+                    from src.perception.yolo_pose_detector import _yolo_pose_cfg, create_yolo_pose_detector
+                    det = create_yolo_pose_detector()
+                    if det is None:
+                        path = _yolo_pose_cfg()["path"]
+                        _note_backend_error("yolo_pose", f"模型文件不存在或无法创建: {path}", "人员检测回退")
+                        _yolo_pose_backend = False
+                    else:
+                        _yolo_pose_backend = det
+                except Exception as exc:
+                    _note_backend_error("yolo_pose", f"{type(exc).__name__}: {exc}", "人员检测回退")
+                    _yolo_pose_backend = False
     return _yolo_pose_backend if _yolo_pose_backend is not False else None
 
 
 def _get_rtmlib():
     global _rtmlib_backend
     if _rtmlib_backend is None:
-        try:
-            from src.perception.rtmlib_backend import create_rtmlib_perception
-            _rtmlib_backend = create_rtmlib_perception()
-        except Exception:
-            _rtmlib_backend = False
+        with _BACKEND_LOCK:
+            if _rtmlib_backend is None:
+                try:
+                    from src.perception.rtmlib_backend import create_rtmlib_perception
+                    _rtmlib_backend = create_rtmlib_perception(raise_errors=True)
+                except Exception as exc:
+                    # Cached: before, a missing model was re-checked on every call (per track per frame)
+                    _note_backend_error("rtmlib", f"{type(exc).__name__}: {exc}", "姿态回退为 YOLO-Pose 17 点")
+                    _rtmlib_backend = False
     return _rtmlib_backend if _rtmlib_backend is not False else None
 
 
@@ -208,15 +232,24 @@ def _estimate_pose_with_fallback(
     bbox: list[float],
     detections: list[dict],
     kpt_thr: float,
+    *,
+    allow_stub: bool = True,
+    frame_rgb: np.ndarray | None = None,
 ) -> tuple[np.ndarray | None, str]:
     """
     Prefer RTMW-133; if quality fails, fall back to YOLO COCO-17 expanded to 133.
     Returns (kpts133, pose_source) or (None, reason).
+
+    ``allow_stub=False`` (live) never returns the synthetic test skeleton.
+    ``frame_rgb``: optional RGB copy of ``frame`` reused across persons.
     """
     rtmlib = _get_rtmlib()
     if rtmlib is not None:
         try:
-            kpts, _ = rtmlib.estimate_pose133(frame, bbox)
+            if frame_rgb is not None:
+                kpts, _ = rtmlib.estimate_pose133(frame, bbox, frame_rgb=frame_rgb)
+            else:
+                kpts, _ = rtmlib.estimate_pose133(frame, bbox)
             accepted, reason = _accept_pose133(kpts, bbox, kpt_thr)
             if accepted is not None:
                 return accepted, "rtmw"
@@ -243,15 +276,19 @@ def _estimate_pose_with_fallback(
         reason = f"{reason}|no_yolo_kpts"
 
     # Last resort stub only when neither backend produced usable pose
-    if rtmlib is None and yolo_k17 is None:
+    if allow_stub and rtmlib is None and yolo_k17 is None:
         accepted, _ = _accept_pose133(_stub_pose133(bbox), bbox, kpt_thr)
         if accepted is not None:
             return accepted, "stub"
     return None, reason
 
 
-def _detect_persons(frame: np.ndarray, det_score_thr: float) -> list[dict]:
-    """Person detections with bbox + score; prefer YOLO-Pose human validation."""
+def _detect_persons(frame: np.ndarray, det_score_thr: float, *, allow_stub: bool = True) -> list[dict]:
+    """Person detections with bbox + score; prefer YOLO-Pose human validation.
+
+    ``allow_stub=False`` (live) raises instead of returning the fixed placeholder
+    person that the offline dev path uses when no detector is installed.
+    """
     cfg = _perception_cfg()
     backend = cfg.get("person_detector", "yolo_pose")
 
@@ -262,10 +299,13 @@ def _detect_persons(frame: np.ndarray, det_score_thr: float) -> list[dict]:
             return _filter_person_detections(detections, frame.shape)
 
     rtmlib = _get_rtmlib()
-    if rtmlib is not None:
+    # RTMLibPerception.detect_persons itself returns the placeholder when it has no detector
+    if rtmlib is not None and (allow_stub or getattr(rtmlib, "detector", None) is not None):
         detections = rtmlib.detect_persons(frame, score_thr=det_score_thr)
         return _filter_person_detections(detections, frame.shape)
 
+    if not allow_stub:
+        raise RuntimeError(f"no person detector available: {BACKEND_ERRORS}")
     return [{"bbox": b, "score": 1.0} for b in _stub_person_detections(frame)]
 
 

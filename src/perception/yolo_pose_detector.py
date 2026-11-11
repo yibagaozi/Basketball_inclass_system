@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import threading
 from pathlib import Path
 
 import cv2
@@ -37,6 +38,17 @@ def _resolve_device() -> str:
         return "cpu"
 
 
+def _to_numpy(t) -> np.ndarray:
+    """ultralytics tensor (CUDA or CPU) or array → numpy, in one transfer."""
+    if hasattr(t, "detach"):
+        t = t.detach()
+    if hasattr(t, "cpu"):
+        t = t.cpu()
+    if hasattr(t, "numpy"):
+        return t.numpy()
+    return np.asarray(t)
+
+
 class YoloPosePersonDetector:
     """Ultralytics YOLO pose model — person bbox gated by keypoint structure."""
 
@@ -60,14 +72,20 @@ class YoloPosePersonDetector:
         self.half = half if half is not None else cfg["half"]
         self.device = device or _resolve_device()
         self._model = None
+        # Live: one shared instance, called from several camera threads
+        self._load_lock = threading.Lock()
+        self._infer_lock = threading.Lock()
 
     def _ensure_model(self):
         if self._model is not None:
             return
-        if not self.model_file.exists():
-            raise FileNotFoundError(f"YOLO pose model not found: {self.model_file}")
-        from ultralytics import YOLO
-        self._model = YOLO(str(self.model_file))
+        with self._load_lock:
+            if self._model is not None:
+                return
+            if not self.model_file.exists():
+                raise FileNotFoundError(f"YOLO pose model not found: {self.model_file}")
+            from ultralytics import YOLO
+            self._model = YOLO(str(self.model_file))
 
     @staticmethod
     def _count_valid_kpts(kpts: np.ndarray, kpt_thr: float, indices: tuple[int, ...] | None = None) -> int:
@@ -132,20 +150,24 @@ class YoloPosePersonDetector:
         if self.half:
             kwargs["half"] = True
 
-        results = self._model(frame_bgr, **kwargs)
+        # ultralytics >= 8.1 also locks internally; older versions are not thread-safe
+        with self._infer_lock:
+            results = self._model(frame_bgr, **kwargs)
         candidates: list[dict] = []
 
         for r in results:
             if r.boxes is None or r.keypoints is None:
                 continue
-            boxes = r.boxes
-            keypoints = r.keypoints.data
-            n = min(len(boxes), len(keypoints))
+            # One device→host copy per tensor per frame (was several tiny synced copies per box)
+            conf_all = _to_numpy(r.boxes.conf)
+            xyxy_all = _to_numpy(r.boxes.xyxy)
+            kpts_all = _to_numpy(r.keypoints.data)
+            n = min(len(conf_all), len(kpts_all))
             for i in range(n):
                 try:
-                    conf = float(boxes.conf[i])
-                    x1, y1, x2, y2 = map(float, boxes.xyxy[i])
-                    kpts = np.asarray(keypoints[i].cpu().numpy(), dtype=np.float32)
+                    conf = float(conf_all[i])
+                    x1, y1, x2, y2 = map(float, xyxy_all[i])
+                    kpts = np.asarray(kpts_all[i], dtype=np.float32)
                     if not self._is_valid_person([x1, y1, x2, y2], kpts, conf, thr):
                         continue
                     candidates.append({

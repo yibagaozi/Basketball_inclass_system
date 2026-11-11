@@ -29,6 +29,10 @@ class BodyEmbedder(ABC):
     def embed(self, image_bgr: np.ndarray, bbox: list[float]) -> np.ndarray:
         ...
 
+    def embed_batch(self, image_bgr: np.ndarray, bboxes: list[list[float]]) -> list[np.ndarray]:
+        """All persons of one frame; backends override to run one forward pass."""
+        return [self.embed(image_bgr, b) for b in bboxes]
+
 
 class StubFaceEmbedder(FaceEmbedder):
     """Dev stub; replace with InsightFace ArcFace in production."""

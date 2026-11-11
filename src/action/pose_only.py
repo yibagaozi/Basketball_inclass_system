@@ -600,6 +600,87 @@ def _subdivide_passes_by_ball_peaks(
     return out
 
 
+_MISS = object()
+
+
+def _freeze(v):
+    if isinstance(v, dict):
+        return tuple(sorted((k, _freeze(x)) for k, x in v.items()))
+    if isinstance(v, (list, tuple)):
+        return tuple(_freeze(x) for x in v)
+    if isinstance(v, np.ndarray):
+        return tuple(v.ravel().tolist())
+    return v
+
+
+def _ball_key(frozen_balls: dict[int, tuple], start_f: int, end_f: int) -> tuple:
+    """Ball samples a window can see: _ball_features looks up frame ids ±2."""
+    if not frozen_balls:
+        return ()
+    out = []
+    for f in range(int(start_f) - 2, int(end_f) + 3):
+        b = frozen_balls.get(f)
+        if b is not None:
+            out.append((f, b))
+    return tuple(out)
+
+
+class WindowMemo:
+    """Reuse per-window evaluations across calls on a sliding sequence (live path).
+
+    A window's evaluation reads only its own frames and the ball samples within
+    ±2 frame ids, so (window frame ids, those ball samples) is an exact key as
+    long as a frame id always carries the same keypoints (true for the live
+    rings, whose payloads are never modified). Call ``end_round()`` after each
+    detection; entries not used in that round are dropped.
+    """
+
+    def __init__(self) -> None:
+        self._prev: dict = {}
+        self._cur: dict = {}
+        self.hits = 0
+        self.misses = 0
+
+    def get(self, key):
+        if key in self._cur:
+            return self._cur[key]
+        if key in self._prev:
+            self.hits += 1
+            v = self._prev[key]
+            self._cur[key] = v
+            return v
+        self.misses += 1
+        return _MISS
+
+    def put(self, key, value) -> None:
+        self._cur[key] = value
+
+    def end_round(self) -> None:
+        self._prev, self._cur = self._cur, {}
+
+
+def _evaluate_window(
+    seq: list[tuple[int, np.ndarray]],
+    i0: int,
+    i1: int,
+    ball_by_frame: dict[int, dict],
+) -> tuple[str, float, str, dict[str, float]] | None:
+    h = _h36m_window(seq, i0, i1)
+    if h is None:
+        return None
+    feat = _pose_features(h)
+    feat.update(_ball_features(seq, i0, i1, ball_by_frame, feat["torso"]))
+    at = float(feat.get("ankle_travel", 0.0))
+    pdx = float(feat.get("pelvis_dx", 0.0))
+    # Wrist-release gate: skip planted shot loads, but keep breakthrough→pull-up
+    if _has_shooting_release(seq, i0, i1) and not (
+        at >= 3.5 and (pdx >= 1.2 or float(feat.get("cog_drop", 0.0)) >= 0.12)
+    ):
+        return None
+    atype, conf, reason = classify_pose_only_window(feat)
+    return atype, conf, reason, feat
+
+
 def detect_pose_only_segments(
     seq: list[tuple[int, np.ndarray]],
     *,
@@ -608,16 +689,23 @@ def detect_pose_only_segments(
     step: int = 8,
     min_conf: float = 0.52,
     max_clips: int = 90,
+    window_memo: WindowMemo | None = None,
 ) -> list[ActionClip]:
     """
     Sliding-window discovery on one camera sequence.
     Pass / triple_threat use same-camera ball track when available.
+
+    ``window_memo`` (live only) reuses window evaluations from earlier calls;
+    the result is identical with or without it.
     """
     if len(seq) < win:
         return []
     frames = [f for f, _ in seq]
     ball_by_frame = ball_by_frame or {}
     candidates: list[tuple[float, ActionClip]] = []
+    frozen_balls = (
+        {f: _freeze(b) for f, b in ball_by_frame.items()} if window_memo is not None else {}
+    )
 
     for i0 in range(0, len(seq) - win + 1, step):
         i1 = i0 + win
@@ -629,19 +717,17 @@ def detect_pose_only_segments(
         # Also reject absurd wall-time span (many seconds of sparse IDs)
         if end_f - start_f > int(win * 4.5):
             continue
-        h = _h36m_window(seq, i0, i1)
-        if h is None:
+        if window_memo is None:
+            ev = _evaluate_window(seq, i0, i1, ball_by_frame)
+        else:
+            key = (tuple(frames[i0:i1]), _ball_key(frozen_balls, start_f, end_f))
+            ev = window_memo.get(key)
+            if ev is _MISS:
+                ev = _evaluate_window(seq, i0, i1, ball_by_frame)
+                window_memo.put(key, ev)
+        if ev is None:
             continue
-        feat = _pose_features(h)
-        feat.update(_ball_features(seq, i0, i1, ball_by_frame, feat["torso"]))
-        at = float(feat.get("ankle_travel", 0.0))
-        pdx = float(feat.get("pelvis_dx", 0.0))
-        # Wrist-release gate: skip planted shot loads, but keep breakthrough→pull-up
-        if _has_shooting_release(seq, i0, i1) and not (
-            at >= 3.5 and (pdx >= 1.2 or float(feat.get("cog_drop", 0.0)) >= 0.12)
-        ):
-            continue
-        atype, conf, reason = classify_pose_only_window(feat)
+        atype, conf, reason, feat = ev
         if conf < min_conf or atype == "unknown":
             continue
         mid = frames[i0 + win // 2]

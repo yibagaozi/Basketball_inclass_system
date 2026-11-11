@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from pathlib import Path
 from typing import Any
 
 import numpy as np
@@ -9,14 +10,14 @@ import numpy as np
 from src.action.halpe2h36m import wholebody133_to_h36m
 from src.pose.angles import compute_h36m_angles, pack_angle_row
 from src.pose.triangulate import load_camera_calibration, triangulate_skeleton17
-from src.streaming.fast_path import RingFrame, TimestampRingBuffer
+from src.streaming.fast_path import RingFrame, TimestampRingBuffer, is_sorted, nearest_index_first, ring_items
 
 
 def _kpts_arr(person: dict[str, Any]) -> np.ndarray | None:
     k = person.get("keypoints")
     if k is None:
         return None
-    arr = np.asarray(k, dtype=np.float64)
+    arr = np.array(k, dtype=np.float64)  # copy: never hand ring data to the math below
     if arr.ndim != 2 or arr.shape[0] < 17:
         return None
     if arr.shape[1] == 2:
@@ -35,24 +36,69 @@ def _kpts_arr(person: dict[str, Any]) -> np.ndarray | None:
 
 
 def _person_for_student(payload: dict[str, Any], student_id: str | None) -> dict[str, Any] | None:
+    """The named student in this view, or None (never another person: triangulating
+    different people across cameras gives meaningless angles)."""
     persons = payload.get("persons") or []
     if student_id:
         for p in persons:
             if p.get("student_id") == student_id:
                 return p
+        return None
     if not persons:
         return None
     return max(persons, key=lambda p: float(p.get("score") or 0.0))
 
 
-def nearest_ring_frame(ring: TimestampRingBuffer, t_ms: float, slop_ms: float = 80.0) -> RingFrame | None:
-    items = list(ring._items)
+def _nearest(items: list[RingFrame], ts: list[float] | None, t_ms: float, slop_ms: float) -> RingFrame | None:
     if not items:
         return None
-    best = min(items, key=lambda x: abs(x.timestamp_ms - t_ms))
+    if ts is not None:
+        best = items[nearest_index_first(ts, t_ms)]
+    else:  # timestamps not monotonic: original linear scan
+        best = min(items, key=lambda x: abs(x.timestamp_ms - t_ms))
     if abs(best.timestamp_ms - t_ms) > slop_ms:
         return None
     return best
+
+
+def _sorted_ts(items: list[RingFrame]) -> list[float] | None:
+    ts = [x.timestamp_ms for x in items]
+    return ts if is_sorted(ts) else None
+
+
+def nearest_ring_frame(
+    ring: TimestampRingBuffer | list[RingFrame], t_ms: float, slop_ms: float = 80.0,
+) -> RingFrame | None:
+    items = ring_items(ring)
+    return _nearest(items, _sorted_ts(items), t_ms, slop_ms)
+
+
+_CALIB_CACHE: dict[str, tuple[tuple, dict]] = {}
+
+
+def _calibration(calib_dir: Any | None) -> dict[str, dict[str, Any]]:
+    """Cameras of this session's calibration, reloaded only when its files change.
+
+    ``None`` means the session has no calibration: no cameras, angles null (as
+    run_live_ws announces). Before, load_camera_calibration(None) silently fell
+    back to the offline data/calibration/v2_4cam_zoned of another setup.
+    """
+    if calib_dir is None:
+        return {}
+    d = Path(calib_dir)
+    try:
+        sig = tuple(sorted(
+            (f.name, f.stat().st_mtime_ns, f.stat().st_size)
+            for f in d.iterdir() if f.name == "cameras.json" or (f.name.startswith("cam_") and f.suffix == ".json")
+        ))
+    except OSError:
+        sig = ()
+    hit = _CALIB_CACHE.get(str(d))
+    if hit is not None and hit[0] == sig:
+        return hit[1]
+    cams = load_camera_calibration(d) if sig else {}
+    _CALIB_CACHE[str(d)] = (sig, cams)
+    return cams
 
 
 def angles_for_window(
@@ -67,12 +113,15 @@ def angles_for_window(
     sample_step_ms: float = 33.0,
 ) -> list[dict[str, Any]]:
     """Triangulate target student in [start_ms, end_ms]; missing angles are null."""
-    cameras = load_camera_calibration(calib_dir)
+    cameras = _calibration(calib_dir)
     usable_cams = [c for c in pose_cams if c in cameras]
     anchor = pose_rings.get("cam_03") or next(iter(pose_rings.values()), None)
     if anchor is None:
         return []
     window = anchor.window(start_ms, end_ms)
+    # one consistent snapshot per camera for the whole window (rings keep growing)
+    snaps = {cam: ring_items(pose_rings[cam]) for cam in pose_cams if pose_rings.get(cam) is not None}
+    snap_ts = {cam: _sorted_ts(items) for cam, items in snaps.items()}
     if not window:
         t = start_ms
         out = []
@@ -90,10 +139,10 @@ def angles_for_window(
         last_t = t
         kpts_by_cam: dict[str, np.ndarray] = {}
         for cam in pose_cams:
-            ring = pose_rings.get(cam)
-            if ring is None:
+            items = snaps.get(cam)
+            if items is None:
                 continue
-            hit = fr if cam == "cam_03" else nearest_ring_frame(ring, t)
+            hit = fr if cam == "cam_03" else _nearest(items, snap_ts[cam], t, 80.0)
             if hit is None:
                 continue
             person = _person_for_student(hit.payload, student_id)

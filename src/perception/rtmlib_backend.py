@@ -85,8 +85,16 @@ class RTMLibPerception:
             out.append({"bbox": [x1, y1, x2, y2], "score": float(score)})
         return out
 
-    def estimate_pose133(self, frame_bgr: np.ndarray, bbox: list[float]) -> tuple[np.ndarray, np.ndarray]:
-        rgb = frame_bgr[:, :, ::-1].copy()
+    def estimate_pose133(
+        self,
+        frame_bgr: np.ndarray,
+        bbox: list[float],
+        *,
+        frame_rgb: np.ndarray | None = None,
+    ) -> tuple[np.ndarray, np.ndarray]:
+        """``frame_rgb``: the same frame already converted once per frame by the
+        caller (live: one conversion instead of a full 1080p copy per person)."""
+        rgb = frame_rgb if frame_rgb is not None else frame_bgr[:, :, ::-1].copy()
         if self._use_custom_pose:
             kpts, scores = self.pose(rgb, bboxes=[bbox])
             if len(kpts) == 0:
@@ -117,12 +125,17 @@ class RTMLibPerception:
         return k3, scores[best_i]
 
 
-def create_rtmlib_perception() -> RTMLibPerception | None:
+def create_rtmlib_perception(*, raise_errors: bool = False) -> RTMLibPerception | None:
+    """RTMLib backend, or None when models are missing / fail to load.
+
+    ``raise_errors=True`` raises instead of returning None so callers can report why.
+    """
     try:
         from src.identity.backends import get_runtime_config
         rt = get_runtime_config()
         if not rt.get("models_ready"):
-            return None
+            missing = [p for p in (rt.get("detector_path"), rt.get("pose_path")) if not p or not Path(p).exists()]
+            raise FileNotFoundError(f"RTMLib models missing: {missing}")
         device = "cuda" if rt["use_cuda"] else "cpu"
         return RTMLibPerception(
             det_model=rt["detector_path"],
@@ -131,4 +144,6 @@ def create_rtmlib_perception() -> RTMLibPerception | None:
             mode=rt.get("pose_mode", "performance"),
         )
     except Exception:
+        if raise_errors:
+            raise
         return None

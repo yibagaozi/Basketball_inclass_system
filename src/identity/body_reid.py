@@ -54,5 +54,23 @@ class OSNetBodyEmbedder(BodyEmbedder):
         feat /= np.linalg.norm(feat) + 1e-8
         return feat
 
+    def embed_batch(self, image_bgr: np.ndarray, bboxes: list[list[float]], chunk: int = 64) -> list[np.ndarray]:
+        """One forward pass (and one device sync) for all persons of a frame.
+
+        Same preprocessing and normalization as ``embed``; outputs agree with it
+        to float32 rounding (~1e-7) — batched kernels sum in a different order.
+        """
+        out: list[np.ndarray] = []
+        for k in range(0, len(bboxes), chunk):
+            arr = np.stack([self._preprocess(image_bgr, b) for b in bboxes[k:k + chunk]])
+            t = self._torch.from_numpy(arr).float().to(self.device)
+            with self._torch.no_grad():
+                feats = self.model(t)
+            for f in feats.cpu().numpy().astype(np.float32):
+                f = f.reshape(-1).copy()
+                f /= np.linalg.norm(f) + 1e-8
+                out.append(f)
+        return out
+
 
 __all__ = ["OSNetBodyEmbedder", "cosine_sim"]

@@ -2,19 +2,27 @@
 
 from __future__ import annotations
 
+import time
 from dataclasses import dataclass, field
+from typing import Any
 
 import numpy as np
 
 from src.identity.embedders import cosine_sim
 from src.identity.enrollment import EnrollmentGallery
 from src.identity.clothing_color import (
+    N_PARTS,
     GalleryColorPrior,
+    _as_parts,
     build_gallery_color_prior,
+    clothing_color_match_batch,
     clothing_color_match_info,
     relative_color_scores,
 )
 from src.config import load_yaml
+
+# Gallery folders are re-listed at most this often (was: on every match call).
+_GALLERY_RELIST_SEC = 2.0
 
 
 def _identity_cfg() -> dict:
@@ -23,6 +31,115 @@ def _identity_cfg() -> dict:
 
 def _clothing_color_weight() -> float:
     return float(_identity_cfg().get("clothing_color_weight", 0.40))
+
+
+def _stack_rows(rows: list[np.ndarray]) -> np.ndarray | None:
+    """(n, d) float32 stack, or None when sample shapes differ (use the scalar path)."""
+    if not rows:
+        return np.zeros((0, 0), dtype=np.float32)
+    flat = [np.asarray(r).reshape(-1) for r in rows]
+    if len({f.shape for f in flat}) != 1:
+        return None
+    return np.stack(flat).astype(np.float32, copy=False)
+
+
+class _GalleryIndex:
+    """Gallery samples stacked per kind, built once per gallery state.
+
+    Matching a detection against it is a few matrix ops instead of ~240 Python
+    cosine / clothing-color calls per detection per frame.
+    """
+
+    def __init__(self, sids: list[str], datas: list[dict], prior: GalleryColorPrior | None):
+        self.sids = sids
+        self.datas = datas  # kept alive: identity of each cached dict is the staleness key
+        self.prior = prior
+        self.regular = True
+        self.face, self.face_norm, self.face_starts, self.face_counts = self._embed_block(datas, "face")
+        self.body, self.body_norm, self.body_starts, self.body_counts = self._embed_block(datas, "body")
+        colors, ok, weights, counts = [], [], [], []
+        for sid, data in zip(sids, datas):
+            samples = data.get("color") or []
+            counts.append(len(samples))
+            w = prior.weights_for(sid) if prior is not None else None
+            w = np.ones(N_PARTS, np.float32) if w is None else np.asarray(w, np.float32).reshape(-1)
+            if w.size != N_PARTS:
+                w = np.ones(N_PARTS, np.float32)
+            for c in samples:
+                parts = _as_parts(c)
+                ok.append(parts is not None)
+                colors.append(parts if parts is not None else np.zeros((N_PARTS, 3), np.float32))
+                weights.append(w)
+        self.color = np.stack(colors) if colors else np.zeros((0, N_PARTS, 3), np.float32)
+        self.color_ok = np.asarray(ok, dtype=bool)
+        self.color_w = np.stack(weights) if weights else np.zeros((0, N_PARTS), np.float32)
+        self.color_counts = np.asarray(counts, dtype=np.int64)
+        self.color_starts = np.concatenate([[0], np.cumsum(self.color_counts)[:-1]]).astype(np.int64)
+
+    def _embed_block(self, datas: list[dict], kind: str):
+        rows, counts = [], []
+        for data in datas:
+            samples = data.get(kind) or []
+            counts.append(len(samples))
+            rows.extend(samples)
+        mat = _stack_rows(rows)
+        if mat is None:
+            self.regular = False
+            mat = np.zeros((0, 0), np.float32)
+        # per-sample norms exactly as cosine_sim computes them
+        norms = np.asarray([np.linalg.norm(r) for r in rows], dtype=np.float32) if mat.size else np.zeros(0, np.float32)
+        counts_arr = np.asarray(counts, dtype=np.int64)
+        starts = np.concatenate([[0], np.cumsum(counts_arr)[:-1]]).astype(np.int64)
+        return mat, norms, starts, counts_arr
+
+    def is_current(self, sids: list[str], datas: list[dict], prior: GalleryColorPrior | None) -> bool:
+        return (
+            prior is self.prior
+            and sids == self.sids
+            and all(a is b for a, b in zip(datas, self.datas))
+        )
+
+    @staticmethod
+    def _seg_max(values: np.ndarray, starts: np.ndarray, counts: np.ndarray) -> np.ndarray:
+        out = np.zeros(len(counts), dtype=np.float64)
+        has = counts > 0
+        if values.size and has.any():
+            out[has] = np.maximum.reduceat(values, starts[has])
+        return out
+
+    def _cos_max(self, q: np.ndarray, mat: np.ndarray, norms: np.ndarray,
+                 starts: np.ndarray, counts: np.ndarray) -> np.ndarray:
+        if mat.shape[0] == 0:
+            return np.zeros(len(counts), dtype=np.float64)
+        dots = mat @ q
+        cos = dots / (np.linalg.norm(q) * norms + 1e-8)
+        return self._seg_max(cos, starts, counts)
+
+    def stats(self, face_emb, body_emb, color_desc, use_color: bool) -> list:
+        """Per student, in gallery order: (sid, has_face_sims, fs, has_body_sims, bs,
+        cs_abs | None, shoe_decisive) — what the scalar pass 1 computes."""
+        n = len(self.sids)
+        has_f = (self.face_counts > 0) if face_emb is not None else np.zeros(n, bool)
+        has_b = (self.body_counts > 0) if body_emb is not None else np.zeros(n, bool)
+        fs = self._cos_max(np.asarray(face_emb), self.face, self.face_norm, self.face_starts,
+                           self.face_counts) if has_f.any() else np.zeros(n)
+        bs = self._cos_max(np.asarray(body_emb), self.body, self.body_norm, self.body_starts,
+                           self.body_counts) if has_b.any() else np.zeros(n)
+        sims = decs = None
+        if use_color and self.color.shape[0]:
+            sims, decs = clothing_color_match_batch(color_desc, self.color, self.color_ok, self.color_w)
+        out = []
+        for i, sid in enumerate(self.sids):
+            cs_abs, shoe = None, False
+            if sims is not None and self.color_counts[i] > 0 and (has_f[i] or has_b[i]):
+                lo = int(self.color_starts[i])
+                seg = sims[lo:lo + int(self.color_counts[i])]
+                j = int(np.argmax(seg))  # first max, like max(infos, key=similarity)
+                cs_abs = float(seg[j])
+                shoe = bool(decs[lo + j])
+            out.append((sid, bool(has_f[i]), float(fs[i]) if has_f[i] else 0.0,
+                        bool(has_b[i]), float(bs[i]) if has_b[i] else 0.0, cs_abs, shoe))
+        return out
 
 
 def _ema_vec(prev: np.ndarray | None, new: np.ndarray | None, alpha: float) -> np.ndarray | None:
@@ -71,6 +188,9 @@ class FaceBodyTracker:
     _tracks: list[Track] = field(default_factory=list)
     _next_id: int = 1
     _color_prior: GalleryColorPrior | None = field(default=None, repr=False)
+    _index: Any = field(default=None, repr=False)
+    _sids: list = field(default_factory=list, repr=False)
+    _sids_at: float = field(default=-1e9, repr=False)
 
     def _ensure_color_prior(self) -> GalleryColorPrior | None:
         """Build once: part weights that maximize inter-person clothing separation."""
@@ -100,12 +220,49 @@ class FaceBodyTracker:
         area_b = (bx2 - bx1) * (by2 - by1)
         return inter / (area_a + area_b - inter + 1e-8)
 
+    def _gallery_index(self, prior: GalleryColorPrior | None) -> _GalleryIndex:
+        now = time.monotonic()
+        if now - self._sids_at >= _GALLERY_RELIST_SEC:
+            self._sids = self.gallery.list_students()
+            self._sids_at = now
+        datas = [self.gallery.load_student(sid) for sid in self._sids]  # cached dicts
+        idx = self._index
+        if idx is None or not idx.is_current(self._sids, datas, prior):
+            idx = self._index = _GalleryIndex(list(self._sids), datas, prior)
+        return idx
+
+    def _pass1_reference(self, face_emb, body_emb, color_desc, use_color: bool, prior) -> list:
+        """Original per-sample pass 1 (scalar cosine / clothing calls). Fallback for
+        galleries whose samples differ in shape, and the reference in tests."""
+        out = []
+        for sid in self.gallery.list_students():
+            data = self.gallery.load_student(sid)
+            face_sims = [cosine_sim(face_emb, f) for f in data["face"]] if face_emb is not None and data["face"] else []
+            body_sims = [cosine_sim(body_emb, b) for b in data["body"]] if body_emb is not None and data["body"] else []
+            fs = max(face_sims) if face_sims else 0.0
+            bs = max(body_sims) if body_sims else 0.0
+            cs_abs, shoe = None, False
+            gallery_colors = data.get("color") or []
+            if (face_sims or body_sims) and use_color and gallery_colors:
+                part_w = prior.weights_for(sid) if prior is not None else None
+                infos = [
+                    clothing_color_match_info(color_desc, c, part_weights=part_w)
+                    for c in gallery_colors
+                ]
+                best_info = max(infos, key=lambda x: float(x.get("similarity") or 0.0))
+                cs_abs = float(best_info.get("similarity") or 0.0)
+                shoe = bool(best_info and best_info.get("shoe_decisive"))
+            out.append((sid, bool(face_sims), fs, bool(body_sims), bs, cs_abs, shoe))
+        return out
+
     def _match_gallery(
         self,
         face_emb: np.ndarray | None,
         body_emb: np.ndarray | None,
         alpha: float,
         color_desc: np.ndarray | None = None,
+        *,
+        _reference: bool = False,
     ) -> tuple[str | None, float, float, str, float]:
         """Return (student_id, face_sim, body_sim, conf, cost)."""
         best_sid, best_cost = None, 1.0
@@ -131,19 +288,20 @@ class FaceBodyTracker:
             color_sep = float(np.max(prior.part_weights) - np.min(prior.part_weights))
 
         # Pass 1: appearance base + absolute clothing sims (for relative transform)
+        use_color = color_desc is not None and color_w > 0
+        index = None if _reference else self._gallery_index(prior)
+        if index is not None and index.regular:
+            stats = index.stats(face_emb, body_emb, color_desc, use_color)
+        else:
+            stats = self._pass1_reference(face_emb, body_emb, color_desc, use_color, prior)
         cand: dict[str, dict] = {}
         abs_color: dict[str, float] = {}
         shoe_decisive_any = False
-        for sid in self.gallery.list_students():
-            data = self.gallery.load_student(sid)
-            face_sims = [cosine_sim(face_emb, f) for f in data["face"]] if face_emb is not None and data["face"] else []
-            body_sims = [cosine_sim(body_emb, b) for b in data["body"]] if body_emb is not None and data["body"] else []
-            fs = max(face_sims) if face_sims else 0.0
-            bs = max(body_sims) if body_sims else 0.0
-            if not face_sims and not body_sims:
+        for sid, has_face, fs, has_body, bs, cs_abs, shoe in stats:
+            if not has_face and not has_body:
                 continue
-            a = float(alpha) if face_sims else 0.0
-            if match_mode == "face_body_color" and body_sims:
+            a = float(alpha) if has_face else 0.0
+            if match_mode == "face_body_color" and has_body:
                 face_cap = float(idcfg.get("face_alpha_high", 0.20))
                 if bs >= 0.70:
                     a = min(a, min(face_cap, 0.12))
@@ -156,24 +314,14 @@ class FaceBodyTracker:
                 elif fs < 0.55:
                     a = min(a, 0.15)
             base_cost = a * (1 - fs) + (1 - a) * (1 - bs)
-            cs_abs = None
-            best_info = None
-            gallery_colors = data.get("color") or []
-            if color_desc is not None and gallery_colors and color_w > 0:
-                part_w = prior.weights_for(sid) if prior is not None else None
-                infos = [
-                    clothing_color_match_info(color_desc, c, part_weights=part_w)
-                    for c in gallery_colors
-                ]
-                best_info = max(infos, key=lambda x: float(x.get("similarity") or 0.0))
-                cs_abs = float(best_info.get("similarity") or 0.0)
+            if cs_abs is not None:
                 abs_color[sid] = cs_abs
-                if best_info.get("shoe_decisive"):
+                if shoe:
                     shoe_decisive_any = True
             cand[sid] = {
                 "fs": fs, "bs": bs, "a": a, "base": base_cost,
-                "face_sims": bool(face_sims), "cs_abs": cs_abs,
-                "shoe_decisive": bool(best_info and best_info.get("shoe_decisive")),
+                "face_sims": has_face, "cs_abs": cs_abs,
+                "shoe_decisive": bool(cs_abs is not None and shoe),
             }
 
         rel_color = (

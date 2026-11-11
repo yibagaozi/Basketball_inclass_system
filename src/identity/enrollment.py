@@ -11,7 +11,18 @@ from src.config import data_path
 from src.identity.embedders import BodyEmbedder, FaceEmbedder, create_body_embedder, create_face_embedder
 
 
+_UNSET = object()
+
+
 class EnrollmentGallery:
+    """Per-session gallery (npy samples on disk).
+
+    The embedders are only needed to *add* samples; matching (live tracker,
+    offline perception) only reads npy files. They are therefore created on
+    first use: before, every gallery opened for matching loaded its own
+    InsightFace + OSNet that nobody used, on top of the caller's own copies.
+    """
+
     def __init__(
         self,
         session_id: str,
@@ -20,9 +31,33 @@ class EnrollmentGallery:
     ):
         self.session_id = session_id
         self.root = data_path("enrollment", session_id)
-        self.face_embedder = face_embedder or create_face_embedder()
-        self.body_embedder = body_embedder or create_body_embedder()
+        self._face_embedder = face_embedder if face_embedder is not None else _UNSET
+        self._body_embedder = body_embedder if body_embedder is not None else _UNSET
         self._cache: dict[str, dict] = {}
+
+    # Galleries built via __new__ (global_registry.create_face_lazy_gallery) assign
+    # these attributes directly; an explicit None stays None, as before.
+    @property
+    def face_embedder(self) -> FaceEmbedder:
+        fe = getattr(self, "_face_embedder", _UNSET)
+        if fe is _UNSET:
+            fe = self._face_embedder = create_face_embedder()
+        return fe
+
+    @face_embedder.setter
+    def face_embedder(self, value: FaceEmbedder | None) -> None:
+        self._face_embedder = value
+
+    @property
+    def body_embedder(self) -> BodyEmbedder:
+        be = getattr(self, "_body_embedder", _UNSET)
+        if be is _UNSET:
+            be = self._body_embedder = create_body_embedder()
+        return be
+
+    @body_embedder.setter
+    def body_embedder(self, value: BodyEmbedder | None) -> None:
+        self._body_embedder = value
 
     def student_dir(self, student_id: str) -> Path:
         d = self.root / student_id

@@ -3,13 +3,15 @@
 # 直播 WS 输出:由“算法起 WS 服务(WsHub)等人连”改为“算法作客户端连 edge 推事件”。
 # 与 WsHub 完全同接口(start_background / publish / stop),LiveEngine 一行都不用改。
 #
-# - 连接:ws://127.0.0.1:8080/internal/cv/stream(edge 的本机内部通道;算法与 edge 同机)
+# - 连接:ws://127.0.0.1:8081/internal/cv/stream(edge 的本机内部通道;算法与 edge 同机)
 # - 每条事件包一层 edge 信封:{"type","seq","ts","payload"},payload = 你现在
 #   build_action_event / build_gap_event 产出的 dict 原样(字段一个都不改名,edge 认 snake_case)。
-# - edge 未起/断开时自动重连;未连上就丢该条(实时数据可丢)。
+# - edge 未起/断开时自动重连;未连上就丢该条(实时数据可丢),jsonl 照常落盘。
+#   连接关闭由 wait_closed() 感知:websockets 旧版(legacy,<14)与新版 asyncio 实现都有该方法。
 import asyncio
 import json
 import threading
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Optional
@@ -18,6 +20,8 @@ import websockets  # 已是 v2.2.0 依赖
 
 # 算法内部事件名 → edge 信封 type
 TYPE_MAP = {"action_finalized": "actionFinalized", "timeline_gap": "timelineGap"}
+
+_LOG_EVERY_SEC = 10.0
 
 
 class EdgeWsClient:
@@ -38,12 +42,19 @@ class EdgeWsClient:
         self._loop: Optional[asyncio.AbstractEventLoop] = None
         self._thread: Optional[threading.Thread] = None
         self._ws = None
+        self._stop_evt: Optional[asyncio.Event] = None
         self._seq = 0
+        self._seq_lock = threading.Lock()  # publish 来自取流线程(gap)与 finalize 线程
+        self._jsonl_lock = threading.Lock()
         self._running = False
+        self.connects = 0  # 成功连上的次数(含重连)
+        self.dropped = 0  # 未连上而丢弃的条数
+        self.send_failed = 0
+        self._last_log = 0.0
 
     def start_background(self) -> None:
         self._running = True
-        self._thread = threading.Thread(target=self._run, daemon=True)
+        self._thread = threading.Thread(target=self._run, name="edge-ws", daemon=True)
         self._thread.start()
 
     def _run(self) -> None:
@@ -51,36 +62,81 @@ class EdgeWsClient:
         asyncio.set_event_loop(self._loop)
         self._loop.run_until_complete(self._connect_loop())
 
+    def _log_throttled(self, msg: str) -> None:
+        now = time.monotonic()
+        if now - self._last_log >= _LOG_EVERY_SEC:
+            self._last_log = now
+            print(f"  [edge-ws] {msg}", flush=True)
+
     async def _connect_loop(self) -> None:
+        self._stop_evt = asyncio.Event()
         while self._running:
             try:
                 async with websockets.connect(self.url, max_size=None) as ws:
                     self._ws = ws
-                    # 只上行,不需要读;保持连接直到断开
-                    while self._running:
-                        await asyncio.sleep(0.5)
-            except Exception:  # edge 未起/断开 → 重连
+                    self.connects += 1
+                    print(f"  [edge-ws] 已连接 {self.url}（第 {self.connects} 次）", flush=True)
+                    # 只上行;等到连接关闭(edge 重启/断网)或 stop() 再出来,然后重连
+                    closed = asyncio.ensure_future(ws.wait_closed())
+                    stopped = asyncio.ensure_future(self._stop_evt.wait())
+                    await asyncio.wait({closed, stopped}, return_when=asyncio.FIRST_COMPLETED)
+                    for t in (closed, stopped):
+                        if not t.done():
+                            t.cancel()
+                    if self._running:
+                        print(f"  [edge-ws] 连接已断开，{self.reconnect_sec:g}s 后重连", flush=True)
+            except Exception as exc:  # edge 未起/拒绝 → 重连
+                self._log_throttled(f"连接 {self.url} 失败: {type(exc).__name__}: {exc}")
+            finally:
                 self._ws = None
-                await asyncio.sleep(self.reconnect_sec)
+            if self._running:
+                try:
+                    await asyncio.wait_for(self._stop_evt.wait(), timeout=self.reconnect_sec)
+                except asyncio.TimeoutError:
+                    pass
+
+    async def _send(self, ws, text: str) -> None:
+        try:
+            await ws.send(text)
+        except Exception as exc:
+            self.send_failed += 1
+            if self._ws is ws:
+                self._ws = None  # 等 _connect_loop 感知关闭后重连
+            self._log_throttled(f"发送失败（累计 {self.send_failed} 条）: {type(exc).__name__}: {exc}")
 
     def publish(self, event: dict[str, Any]) -> None:
         # 可选:和原来一样落本地 jsonl
         if self.jsonl_path:
-            with self.jsonl_path.open("a", encoding="utf-8") as f:
-                f.write(json.dumps(event, ensure_ascii=False) + "\n")
-        self._seq += 1
+            line = json.dumps(event, ensure_ascii=False) + "\n"
+            with self._jsonl_lock:
+                with self.jsonl_path.open("a", encoding="utf-8") as f:
+                    f.write(line)
+        with self._seq_lock:
+            self._seq += 1
+            seq = self._seq
         frame = {
             "type": TYPE_MAP.get(event.get("event"), event.get("event")),
-            "seq": self._seq,
+            "seq": seq,
             "ts": datetime.now(timezone.utc).isoformat(),
             "payload": event,  # ← 原事件 dict 原样,字段不改名
         }
         loop, ws = self._loop, self._ws
-        if loop is None or ws is None:
-            return  # 未连上就丢这条(edge 断线;实时数据可丢)
-        asyncio.run_coroutine_threadsafe(
-            ws.send(json.dumps(frame, ensure_ascii=False)), loop
-        )
+        if loop is None or ws is None or loop.is_closed():
+            self.dropped += 1  # 未连上就丢这条(edge 断线;实时数据可丢)
+            self._log_throttled(f"未连接 edge，已丢弃 {self.dropped} 条（jsonl 已记录）")
+            return
+        coro = self._send(ws, json.dumps(frame, ensure_ascii=False))
+        try:
+            asyncio.run_coroutine_threadsafe(coro, loop)
+        except RuntimeError:  # loop 已关闭
+            coro.close()
+            self.dropped += 1
 
     def stop(self) -> None:
         self._running = False
+        loop, evt = self._loop, self._stop_evt
+        if loop is not None and evt is not None and not loop.is_closed():
+            try:
+                loop.call_soon_threadsafe(evt.set)
+            except RuntimeError:
+                pass

@@ -100,8 +100,12 @@ class RtspCameraWorker:
         on_gap: GapCallback | None = None,
         queue: deque[LiveFrame] | None = None,
         queue_max: int = 60,
+        pace_files: bool = True,
     ):
         self.camera_id = camera_id
+        # Local files decode far faster than real time; stamps are wall-clock, so
+        # unpaced playback compressed the timeline. Pace to the file's FPS.
+        self.pace_files = pace_files
         self.url = url
         self.offset_ms = float(offset_ms)
         self.session_id = session_id
@@ -111,7 +115,7 @@ class RtspCameraWorker:
         self.loop_file = loop_file
         self.on_frame = on_frame
         self.on_gap = on_gap
-        self.queue = queue if queue is not None else deque(maxlen=queue_max)
+        self.queue = queue if queue is not None else deque(maxlen=max(0, queue_max))
         self.queue_max = queue_max
         self.stats = CaptureStats()
         self._stop = threading.Event()
@@ -147,13 +151,16 @@ class RtspCameraWorker:
         ))
 
     def _push(self, item: LiveFrame) -> None:
-        q = self.queue
-        if self.queue_max > 0 and len(q) >= self.queue_max:
-            try:
-                q.popleft()
-            except IndexError:
-                pass
-        q.append(item)
+        # queue_max <= 0: callback only. The live engine takes frames via on_frame;
+        # keeping 60 decoded 1080p frames per camera (~1.5 GB for 4) unread was waste.
+        if self.queue_max > 0:
+            q = self.queue
+            if len(q) >= self.queue_max:
+                try:
+                    q.popleft()
+                except IndexError:
+                    pass
+            q.append(item)
         if self.on_frame is not None:
             self.on_frame(item)
 
@@ -167,7 +174,16 @@ class RtspCameraWorker:
                     time.sleep(self.reconnect_sec)
                     continue
                 file_loop = self.loop_file and not _is_rtsp(self.url)
+                pace = self.pace_files and not _is_rtsp(self.url)
+                fps = float(cap.get(cv2.CAP_PROP_FPS) or 0.0) if pace else 0.0
+                period = 1.0 / fps if 1.0 <= fps <= 240.0 else (1.0 / 25.0 if pace else 0.0)
+                next_t = time.monotonic()
                 while not self._stop.is_set():
+                    if period:
+                        delay = next_t - time.monotonic()
+                        if delay > 0:
+                            time.sleep(delay)
+                        next_t = max(next_t + period, time.monotonic() - period)
                     ok, fr = cap.read()
                     wall = time.time() * 1000.0
                     if not ok or fr is None:
@@ -231,7 +247,7 @@ class MultiRtspCapture:
         self.queues: dict[str, deque[LiveFrame]] = {}
         for cam in CAMS:
             url = urls.get(cam) or ""
-            q: deque[LiveFrame] = deque(maxlen=queue_max)
+            q: deque[LiveFrame] = deque(maxlen=max(0, queue_max))
             self.queues[cam] = q
             self.workers[cam] = RtspCameraWorker(
                 cam, url, float(self.offsets_ms.get(cam, 0.0)),

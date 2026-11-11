@@ -15,6 +15,8 @@ Live WebSocket emits one JSON per finalized action (plus ``timeline_gap``).
 from __future__ import annotations
 
 import json
+import threading
+from bisect import bisect_left
 import time
 from collections import deque
 from dataclasses import dataclass, field
@@ -34,25 +36,66 @@ class RingFrame:
 
 @dataclass
 class TimestampRingBuffer:
-    """Fixed-duration ring of timestamped payloads (pose / ball samples)."""
+    """Fixed-duration ring of timestamped payloads (pose / ball samples).
+
+    Thread-safe: live inference threads push while the finalize thread reads.
+    Readers must use ``snapshot()`` / ``window()`` / ``latest()``: iterating
+    ``_items`` directly while another thread pushes raises
+    ``RuntimeError: deque mutated during iteration``.
+    """
 
     capacity_ms: float = 60_000.0
     _items: deque[RingFrame] = field(default_factory=deque)
+    _lock: threading.Lock = field(default_factory=threading.Lock, repr=False, compare=False)
 
     def push(self, timestamp_ms: float, frame_idx: int, payload: dict[str, Any]) -> None:
-        self._items.append(RingFrame(timestamp_ms, frame_idx, payload))
-        self._trim(timestamp_ms)
+        with self._lock:
+            self._items.append(RingFrame(timestamp_ms, frame_idx, payload))
+            self._trim(timestamp_ms)
 
     def _trim(self, now_ms: float) -> None:
         lo = now_ms - self.capacity_ms
         while self._items and self._items[0].timestamp_ms < lo:
             self._items.popleft()
 
+    def snapshot(self) -> list[RingFrame]:
+        """Consistent copy of the current items (oldest first)."""
+        with self._lock:
+            return list(self._items)
+
+    def latest(self) -> RingFrame | None:
+        with self._lock:
+            return self._items[-1] if self._items else None
+
     def window(self, t0_ms: float, t1_ms: float) -> list[RingFrame]:
-        return [x for x in self._items if t0_ms <= x.timestamp_ms <= t1_ms]
+        return [x for x in self.snapshot() if t0_ms <= x.timestamp_ms <= t1_ms]
 
     def __len__(self) -> int:
         return len(self._items)
+
+
+def nearest_index_first(ts: list[float], t: float) -> int:
+    """Index that ``min(range(len(ts)), key=lambda i: abs(ts[i] - t))`` returns for
+    non-decreasing ``ts`` (the first index on ties), in O(log n)."""
+    i = bisect_left(ts, t)
+    if i == 0:
+        return 0
+    if i == len(ts):
+        return bisect_left(ts, ts[-1])
+    lo, hi = i - 1, i
+    j = lo if abs(ts[lo] - t) <= abs(ts[hi] - t) else hi
+    return bisect_left(ts, ts[j])  # first of equal timestamps
+
+
+def is_sorted(ts: list[float]) -> bool:
+    return all(ts[k] <= ts[k + 1] for k in range(len(ts) - 1))
+
+
+def ring_items(ring: "TimestampRingBuffer | list[RingFrame]") -> list[RingFrame]:
+    """Items of a ring (snapshot) or of an already-taken snapshot list."""
+    if isinstance(ring, TimestampRingBuffer):
+        return ring.snapshot()
+    return ring
 
 
 @dataclass
