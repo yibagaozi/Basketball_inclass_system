@@ -9,6 +9,7 @@ Convention (same as offline group sync / event_sync):
 from __future__ import annotations
 
 import json
+import time
 from pathlib import Path
 from typing import Any
 
@@ -28,6 +29,20 @@ def normalize_offsets(
     out = {c: float(raw.get(c, 0.0) or 0.0) for c in CAMS}
     out[str(anchor_camera)] = 0.0
     return out
+
+
+# Process-wide anchor for capture.clock = monotonic: epoch-ms values like time.time(),
+# but immune to system clock steps (NTP / manual changes) during a class.
+_WALL0_MS = time.time() * 1000.0
+_MONO0 = time.monotonic()
+
+
+def capture_now_ms(clock: str = "wall") -> float:
+    """Frame timestamp source. ``wall`` (default, 2.2.0): time.time();
+    ``monotonic``: same scale, anchored once per process, never jumps."""
+    if clock == "monotonic":
+        return _WALL0_MS + (time.monotonic() - _MONO0) * 1000.0
+    return time.time() * 1000.0
 
 
 def common_ms(local_ms: float, offset_ms: float) -> float:

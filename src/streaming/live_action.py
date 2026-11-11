@@ -391,6 +391,8 @@ def detect_live_actions(
     cache: ActionDetectCache | None = None,
     window_ms: float | None = None,
     min_items: int = 150,
+    pre_ms: float | None = None,
+    post_ms: float | None = None,
 ) -> list[dict[str, Any]]:
     """cam_03 pose + cam_04 ball → action candidates (not yet WS-emitted).
 
@@ -403,6 +405,10 @@ def detect_live_actions(
     ``min_items`` samples) is searched — actions older than that were reported
     in earlier rounds. None / 0 searches the whole ring (2.2.0 behaviour).
     Requires monotonic frame_idx (live capture) when used with a cache.
+
+    ``pre_ms`` / ``post_ms`` (opt-in): release-based action spans release-pre_ms ..
+    release+post_ms in time instead of 40 / 25 samples, whose duration depends on
+    how many frames inference managed to process.
     """
     pose_ring = ring_items(pose_ring)
     ball_ring = ring_items(ball_ring)
@@ -443,8 +449,18 @@ def detect_live_actions(
                 atype, cls_meta = "free_throw", {}
             if not is_shooting_action(atype):
                 atype = "free_throw"
-            start = frames[max(0, peak_idx - 40)]
-            end = frames[min(len(frames) - 1, peak_idx + 25)]
+            if pre_ms is not None and post_ms is not None:
+                t_rel = meta[peak_idx][1]
+                i0 = peak_idx
+                while i0 > 0 and meta[i0 - 1][1] >= t_rel - pre_ms:
+                    i0 -= 1
+                i1 = peak_idx
+                while i1 < len(frames) - 1 and meta[i1 + 1][1] <= t_rel + post_ms:
+                    i1 += 1
+                start, end = frames[i0], frames[i1]
+            else:
+                start = frames[max(0, peak_idx - 40)]
+                end = frames[min(len(frames) - 1, peak_idx + 25)]
             phases = _phases_for_action(atype, start, release, end)
             clip = ActionClip(
                 action_type=atype,

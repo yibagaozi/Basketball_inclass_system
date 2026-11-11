@@ -80,8 +80,14 @@ def build_action_event(
     global_id: str | None = None,
     confidence: float | None = None,
     extra: dict[str, Any] | None = None,
+    action_id: str | None = None,
 ) -> dict[str, Any]:
-    """One WS message at action finalize. Nullable fields stay JSON null."""
+    """One WS message at action finalize. Nullable fields stay JSON null.
+
+    ``action_id`` (live engine): unique per emitted action, also carried by the
+    ``[cv-event] action_emitted`` log line so edge / cloud logs can be joined.
+    Omitted from the message when not given (offline output unchanged).
+    """
     atype = normalize_action_type(action_type) if action_type else None
     if atype == "unknown":
         atype = action_type
@@ -117,6 +123,8 @@ def build_action_event(
         "angles": packed_angles,
         "angle_keys": list(ANGLE_KEYS),
     }
+    if action_id:
+        msg["action_id"] = str(action_id)
     if extra:
         msg["metadata"] = extra
     return msg

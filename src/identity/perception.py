@@ -235,6 +235,7 @@ def _estimate_pose_with_fallback(
     *,
     allow_stub: bool = True,
     frame_rgb: np.ndarray | None = None,
+    use_rtmw: bool = True,
 ) -> tuple[np.ndarray | None, str]:
     """
     Prefer RTMW-133; if quality fails, fall back to YOLO COCO-17 expanded to 133.
@@ -242,9 +243,13 @@ def _estimate_pose_with_fallback(
 
     ``allow_stub=False`` (live) never returns the synthetic test skeleton.
     ``frame_rgb``: optional RGB copy of ``frame`` reused across persons.
+    ``use_rtmw=False`` (live inference.rtmw_cameras): skip RTMW, use the YOLO-Pose
+    keypoints from detection directly.
     """
-    rtmlib = _get_rtmlib()
-    if rtmlib is not None:
+    rtmlib = _get_rtmlib() if use_rtmw else None
+    if not use_rtmw:
+        reason = "rtmw_off"
+    elif rtmlib is not None:
         try:
             if frame_rgb is not None:
                 kpts, _ = rtmlib.estimate_pose133(frame, bbox, frame_rgb=frame_rgb)

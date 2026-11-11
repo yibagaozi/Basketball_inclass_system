@@ -16,7 +16,7 @@ from urllib.parse import urlparse
 import cv2
 import numpy as np
 
-from src.streaming.clock import CAMS, common_ms as to_common
+from src.streaming.clock import CAMS, capture_now_ms, common_ms as to_common
 from src.streaming.events import build_gap_event
 
 GapCallback = Callable[[dict[str, Any]], None]
@@ -101,8 +101,10 @@ class RtspCameraWorker:
         queue: deque[LiveFrame] | None = None,
         queue_max: int = 60,
         pace_files: bool = True,
+        clock: str = "wall",
     ):
         self.camera_id = camera_id
+        self.clock = clock  # "wall" (default) | "monotonic", see clock.capture_now_ms
         # Local files decode far faster than real time; stamps are wall-clock, so
         # unpaced playback compressed the timeline. Pace to the file's FPS.
         self.pace_files = pace_files
@@ -171,7 +173,7 @@ class RtspCameraWorker:
                 cap = open_video_source(self.url, ffmpeg_tcp=self.ffmpeg_tcp)
                 if not cap.isOpened():
                     self.stats.last_error = f"open_failed:{self.url}"
-                    time.sleep(self.reconnect_sec)
+                    self._stop.wait(self.reconnect_sec)  # stop() wakes it (was time.sleep)
                     continue
                 file_loop = self.loop_file and not _is_rtsp(self.url)
                 pace = self.pace_files and not _is_rtsp(self.url)
@@ -185,14 +187,16 @@ class RtspCameraWorker:
                             time.sleep(delay)
                         next_t = max(next_t + period, time.monotonic() - period)
                     ok, fr = cap.read()
-                    wall = time.time() * 1000.0
+                    wall = capture_now_ms(self.clock)
                     if not ok or fr is None:
+                        if file_loop:
+                            # End of a local test file: rewind. Not a disconnect, so no
+                            # timeline_gap (was one spurious gap event per loop per camera).
+                            cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+                            continue
                         if self._last_ok_common is not None:
                             now_c = to_common(wall, self.offset_ms)
                             self._emit_gap(self._last_ok_common, now_c, "disconnect")
-                        if file_loop:
-                            cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
-                            continue
                         break
                     local = wall
                     common = to_common(local, self.offset_ms)
@@ -223,7 +227,7 @@ class RtspCameraWorker:
             if self._stop.is_set():
                 break
             self.stats.reconnects += 1
-            time.sleep(self.reconnect_sec)
+            self._stop.wait(self.reconnect_sec)
 
 
 class MultiRtspCapture:
@@ -241,6 +245,7 @@ class MultiRtspCapture:
         queue_max: int = 60,
         on_gap: GapCallback | None = None,
         on_frame: FrameCallback | None = None,
+        clock: str = "wall",
     ):
         self.offsets_ms = dict(offsets_ms)
         self.workers: dict[str, RtspCameraWorker] = {}
@@ -259,6 +264,7 @@ class MultiRtspCapture:
                 on_gap=on_gap,
                 queue=q,
                 queue_max=queue_max,
+                clock=clock,
             )
 
     def start(self) -> None:

@@ -1,5 +1,76 @@
 # Changelog
 
+## 2.2.0+enroll.1.live.3（重新整理）— 2026-11-11
+
+原补丁 0009–0029 重新整理为三个补丁，在 2.2.0+enroll.1（0001–0005）上安装；不依赖 0006–0008（标定修复，只改标定相关文件，可先可后）：
+
+- live-01：实时推理可靠性与性能（原 0010–0020）
+- live-02：长时间运行稳定性、观测锚点、默认关闭的开关、文档与版本（原 0021–0025、0027–0029 与文档 0009、0022、0028）
+- live-03（可选，可暂缓）：录像回放与精度评估工具（原 0026）
+
+装完 live-01 + live-02 与按原顺序装完 0009–0029 的代码相同（只少评估工具）。
+
+## 2.2.0+enroll.1.live.3 — 2026-11-04（增量补丁 0029）
+
+见 `docs/实时推理长时间运行排查.md`。修复“运行一段时间后不再输出”的几条永久停住路径：
+
+- finalize 循环任何异常都不再结束线程（原来一次写 events.jsonl 失败，如磁盘满，就会让本节课之后不再有动作和 `[live]` 日志）
+- events.jsonl / metrics.jsonl 写失败只计数，推送 edge 不受影响；numpy 值可序列化
+- stdout/stderr 被管道读取时异步写出：edge 读不动时丢弃日志并计数，不再卡住推理
+- 看门狗：卡住或线程退出时写线程堆栈文件、输出 `stall` 事件，持续 180 s 退出进程由 edge 自动重启（`watchdog.*`）
+- Windows：直播推理运行期间禁止系统睡眠
+
+## 2.2.0+enroll.1.live.2 — 2026-10-15（增量补丁 0023–0028）
+
+见 `docs/实时推理观测与精度评估.md`。
+
+### 观测（调用方打 log 的锚点）
+- 每 10 s 一行 `[cv-metrics] {json}`：各机位帧率/丢帧/延迟、已识别比例、身份置信度分布、ID 切换、姿态来源、各阶段耗时；
+  动作数/未归属/命中分布/发出延迟；推送通道状态；GC、内存
+- 离散事件 `[cv-event] {json}`：live_start、models_ready、model_warning、capture_start、hoop_locked、identity_switch、
+  timeline_gap、ws_connected/ws_disconnected、action_emitted、live_stop、*_error
+- 同样内容写 `data/outputs/live/<课程id>/metrics.jsonl`；配置 `observability.*`（默认开启，`enabled: false` 关闭）
+- 动作消息新增 `action_id`（与 action_emitted 事件一致），edge 可按它串联日志
+
+### 精度评估
+- `scripts/replay_live.py`：录像按实时速度走直播引擎，输出 events.jsonl / metrics.jsonl
+- `scripts/eval_live_events.py`：对真值（v3 真值文档或 CSV）计算召回/精确率/类型混淆/时间误差/归属准确率/命中判定/角度覆盖率；
+  无真值时汇总代理指标
+
+### 性能（可选，默认关闭）
+- `inference.feature_interval`：已确认身份的轨迹每 N 帧刷新人脸与衣着特征（CPU 冒烟：特征阶段 −61%，处理帧率约 ×2）
+- `inference.rtmw_cameras`：只在指定机位跑 RTMW
+
+### 修复
+- 本地测试文件循环播放时不再发出虚假的 timeline_gap
+- 单条消息发送异常不再断开推送通道（只有连接关闭才重连）
+- 停止时不再等待取流线程的重连间隔
+- 指标批次从模型就绪后开始计时
+
+## 2.2.0+enroll.1.live.1 — 2026-10-09（增量补丁 0010–0022）
+
+实时推理（`run_live_ws.py run`）按 `docs/实时推理审查.md` 修复。
+
+### 可靠性
+- edge 重启后自动重连推送通道（原来连接关闭后事件全部静默丢失）
+- 环形缓冲区线程安全，动作检测/角度按快照读取（原来 `deque mutated during iteration` 使整轮检测被跳过）
+- 动作与角度只用该学生自己的骨架，事件按真实学生归属（**结果变化**）
+- 未匹配（漂移）轨迹不再估计姿态，与离线一致（**结果变化**）
+- 启动时预加载并预热全部模型；无人员检测器即报错退出，不再降级为占位假人；可选模型缺失有明确提示
+- 无本堂标定时角度为 null，不再静默使用离线 v2 标定（**结果变化**）
+
+### 性能
+- 跟踪器比对注册库矩阵化：20 人/帧 1034 → 31 ms/帧/机位，决策不变
+- 动作检测：每轮约 5 s → 0.19 s（单遍序列、二分配对、按学生缓存、pose-only 滑窗记忆、15 s 检测窗口）
+- 关键点以数组存入缓冲区：内存约 1/10，完整垃圾回收 645 → 26 ms
+- RTMW 的 RGB 每帧转换一次；身体 ReID 按帧批量；YOLO 结果每帧一次拷回 CPU
+- gallery 嵌入模型按需创建；直播不再保留无人读取的帧队列（约 1.5 GB）；推理线程按需唤醒
+
+### 新配置（默认值保持原行为，除检测窗口外）
+- `finalize.detect_window_ms`（15000，0 = 整环）、`finalize.detect_min_items`（150）
+- 可选：`finalize.window_by_ms`、`capture.clock: monotonic`、`inference.min_interval_ms`、`ball.hoop_lock: median`、
+  `identity.live_body_batch`（cameras.yaml，默认 true）
+
 ## 2.2.0+enroll.1 — 2026-10-08（增量包）
 
 ### 性能（注册）
