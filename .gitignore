@@ -52,3 +52,7 @@ checkpoints/
 
 # Offline data/model archives
 packs/
+
+sessions/
+tests/
+identity/
